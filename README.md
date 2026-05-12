@@ -117,7 +117,7 @@ API Key 会直接显示在管理页中，方便本机维护配置。不要把管
 ```bash
 cd /Users/liangrn/Documents/Codes/CodexProxy
 conda activate iai
-./run.sh
+./start.sh
 ```
 
 默认监听：
@@ -131,7 +131,7 @@ http://127.0.0.1:8383
 ```bash
 cd /Users/liangrn/Documents/Codes/CodexProxy
 conda activate iai
-nohup ./run.sh > codexproxy.log 2>&1 &
+nohup ./start.sh > codexproxy.log 2>&1 &
 ```
 
 关停服务：
