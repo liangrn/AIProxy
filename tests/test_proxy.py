@@ -72,9 +72,9 @@ def test_non_stream_response_passes_through_upstream_responses_when_configured(m
             "api_key": "test-key",
             "default_model": "gpt-5.5",
             "models": "gpt-5.5",
-            "api_style": "responses",
         },
     )
+    client.post("/admin/codex/config", json={"api_style": "responses"})
 
     response = client.post("/v1/responses", json={"input": "say hi", "stream": False})
 
@@ -108,7 +108,6 @@ def test_auto_api_style_falls_back_to_chat_when_responses_is_unsupported(monkeyp
             "api_key": "test-key",
             "default_model": "gpt-5.5",
             "models": "gpt-5.5",
-            "api_style": "auto",
         },
     )
 
@@ -282,22 +281,22 @@ def test_default_port_is_8383(monkeypatch):
     assert get_settings().listen_port == 8383
 
 
-def test_admin_config_persists_and_models_use_it(monkeypatch, tmp_path):
+def test_admin_profile_persists_and_models_use_it(monkeypatch, tmp_path):
     config_path = tmp_path / "config.local.json"
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("UPSTREAM_API_KEY", "old-key")
 
     client = TestClient(create_app())
     response = client.post(
-        "/admin/config",
+        "/admin/profiles/new-provider",
         json={
-            "upstream_provider_name": "new-provider",
-            "upstream_base_url": "https://new.example/v1/",
-            "upstream_api_key": "new-key",
-            "upstream_model": "model-b",
-            "upstream_models": ["model-a", "model-b", "model-a", ""],
-            "upstream_user_agent": "test-agent",
-            "request_timeout_seconds": 45,
+            "name": "new-provider",
+            "base_url": "https://new.example/v1/",
+            "api_key": "new-key",
+            "default_model": "model-b",
+            "models": ["model-a", "model-b", "model-a", ""],
+            "user_agent": "test-agent",
+            "timeout_seconds": 45,
         },
     )
 
@@ -335,30 +334,30 @@ def test_legacy_codexproxy_config_path_still_works(monkeypatch, tmp_path):
     assert runtime_config_path() == legacy_path
 
 
-def test_admin_config_keeps_existing_api_key_when_blank(monkeypatch, tmp_path):
+def test_edit_profile_keeps_existing_api_key_when_blank(monkeypatch, tmp_path):
     config_path = tmp_path / "config.local.json"
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
 
     client = TestClient(create_app())
     assert client.post(
-        "/admin/config",
+        "/admin/profiles/first",
         json={
-            "upstream_provider_name": "first",
-            "upstream_base_url": "https://first.example/v1",
-            "upstream_api_key": "secret-key",
-            "upstream_model": "model-a",
-            "upstream_models": "model-a",
+            "name": "first",
+            "base_url": "https://first.example/v1",
+            "api_key": "secret-key",
+            "default_model": "model-a",
+            "models": "model-a",
         },
     ).status_code == 200
 
     response = client.post(
-        "/admin/config",
+        "/admin/profiles/first",
         json={
-            "upstream_provider_name": "second",
-            "upstream_base_url": "https://second.example/v1",
-            "upstream_api_key": "",
-            "upstream_model": "model-b",
-            "upstream_models": "model-b",
+            "name": "second",
+            "base_url": "https://second.example/v1",
+            "api_key": "",
+            "default_model": "model-b",
+            "models": "model-b",
         },
     )
 
@@ -410,7 +409,7 @@ def test_admin_profiles_switch_active_profile_and_normalize_base_url(monkeypatch
     assert settings.upstream_base_url == "https://aicoego.example/v1"
     assert settings.upstream_api_key == "aicoego-key"
     assert settings.upstream_model == "aicoego-default"
-    assert settings.upstream_api_style == "chat"
+    assert settings.upstream_api_style == "auto"
 
     response = client.get("/v1/models")
     assert response.json()["data"] == [
@@ -527,6 +526,133 @@ def test_claude_messages_maps_model_and_rewrites_response_model(monkeypatch, tmp
     assert response.json()["model"] == "claude-opus-4.6"
 
 
+def test_claude_chat_protocol_uses_chat_completions(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    captured = {}
+
+    async def fake_post(self, url, headers, json):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["payload"] = json
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat_1",
+                "model": "glm-5.1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/aigocode",
+        json={
+            "name": "AiGoCode",
+            "base_url": "https://api.aigocode.com/v1",
+            "api_key": "aigocode-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "aigocode",
+            "api_style": "chat",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post(
+        "/anthropic/v1/messages",
+        headers={"anthropic-version": "2023-06-01", "anthropic-beta": "test-beta"},
+        json={
+            "model": "claude-opus-4.6",
+            "max_tokens": 8,
+            "system": "follow system",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["url"] == "https://api.aigocode.com/v1/chat/completions"
+    assert captured["payload"]["model"] == "glm-5.1"
+    assert captured["payload"]["messages"] == [
+        {"role": "system", "content": "follow system"},
+        {"role": "user", "content": "ping"},
+    ]
+    assert "anthropic-version" not in captured["headers"]
+    assert "anthropic-beta" not in captured["headers"]
+    body = response.json()
+    assert body["model"] == "claude-opus-4.6"
+    assert body["content"] == [{"type": "text", "text": "ok"}]
+
+
+def test_claude_auto_protocol_falls_back_to_chat_when_messages_unsupported(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    calls = []
+
+    async def fake_post(self, url, headers, json):
+        calls.append(url)
+        if url.endswith("/messages"):
+            return httpx.Response(
+                403,
+                json={"error": {"message": "This group does not allow /v1/messages dispatch", "type": "permission_error"}, "type": "error"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat_1",
+                "model": "glm-5.1",
+                "choices": [{"message": {"role": "assistant", "content": "fallback ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/aigocode",
+        json={
+            "name": "AiGoCode",
+            "base_url": "https://api.aigocode.com/v1",
+            "api_key": "aigocode-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "aigocode",
+            "api_style": "auto",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post(
+        "/anthropic/v1/messages",
+        json={
+            "model": "claude-opus-4.6",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        "https://api.aigocode.com/v1/messages",
+        "https://api.aigocode.com/v1/chat/completions",
+    ]
+    assert response.json()["content"] == [{"type": "text", "text": "fallback ok"}]
+
+
 def test_claude_models_expose_mapped_claude_names(monkeypatch, tmp_path):
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
 
@@ -602,6 +728,53 @@ def test_claude_model_exact_mapping_takes_precedence_over_wildcard():
     assert resolve_claude_model("claude-opus-4.7", mappings) == "fallback-model"
 
 
+def test_claude_protocol_check_uses_selected_chat_protocol(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    async def fake_post(self, url, headers, json):
+        assert url == "https://api.aigocode.com/v1/chat/completions"
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat_1",
+                "model": "glm-5.1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/aigocode",
+        json={
+            "name": "AiGoCode",
+            "base_url": "https://api.aigocode.com/v1",
+            "api_key": "aigocode-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "aigocode",
+            "api_style": "chat",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post("/admin/claude/protocol/check", json={"model": "claude-opus-4.6"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["upstream"]["messages_url"] == "https://api.aigocode.com/v1/chat/completions"
+    assert body["response_model"] == "claude-opus-4.6"
+
+
 def test_admin_config_exposes_api_style(monkeypatch, tmp_path):
     config_path = tmp_path / "config.local.json"
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
@@ -615,14 +788,193 @@ def test_admin_config_exposes_api_style(monkeypatch, tmp_path):
             "api_key": "test-key",
             "default_model": "gpt-5.5",
             "models": "gpt-5.5",
-            "api_style": "responses",
         },
     )
 
     response = client.get("/admin/config")
 
     assert response.status_code == 200
-    assert response.json()["config"]["active"]["api_style"] == "responses"
+    body = response.json()["config"]
+    assert body["codex"]["api_style"] == "auto"
+    assert body["claude"]["api_style"] == "auto"
+    assert "api_style" not in body["active"]
+    assert "api_style" not in body["profiles"]["responses-provider"]
+
+
+def test_update_codex_config_changes_active_profile_and_api_style(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/uocode",
+        json={
+            "name": "UoCode",
+            "base_url": "https://www.uocode.com",
+            "api_key": "uocode-key",
+            "default_model": "gpt-5.5",
+            "models": "gpt-5.5",
+        },
+    )
+    client.post(
+        "/admin/profiles/aicoego",
+        json={
+            "name": "AiCoeGo",
+            "base_url": "https://aicoego.example",
+            "api_key": "aicoego-key",
+            "default_model": "gpt-5.4",
+            "models": "gpt-5.4",
+        },
+    )
+    initial_claude_profile = client.get("/admin/config").json()["config"]["claude"]["active_profile"]
+
+    response = client.post(
+        "/admin/codex/config",
+        json={"active_profile": "aicoego", "api_style": "responses"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()["config"]
+    assert body["codex"]["active_profile"] == "aicoego"
+    assert body["codex"]["api_style"] == "responses"
+    assert body["claude"]["active_profile"] == initial_claude_profile
+    assert get_settings().upstream_api_style == "responses"
+
+
+def test_codex_protocol_check_uses_selected_responses_protocol(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    async def fake_post(self, url, headers, json):
+        assert url == "https://api.aigocode.com/v1/responses"
+        assert json["model"] == "gpt-5.4"
+        assert json["input"] == "ping"
+        assert json["stream"] is False
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_1",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5.4",
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}],
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/aigocode",
+        json={
+            "name": "AiGoCode",
+            "base_url": "https://api.aigocode.com/v1",
+            "api_key": "aigocode-key",
+            "default_model": "gpt-5.4",
+            "models": "gpt-5.4",
+        },
+    )
+    client.post("/admin/codex/config", json={"active_profile": "aigocode", "api_style": "responses"})
+
+    response = client.post("/admin/codex/protocol/check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["upstream"]["resolved_api_style"] == "responses"
+    assert body["upstream"]["protocol_url"] == "https://api.aigocode.com/v1/responses"
+    assert body["upstream"]["model"] == "gpt-5.4"
+
+
+def test_codex_protocol_check_uses_selected_chat_protocol(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    async def fake_post(self, url, headers, json):
+        assert url == "https://api.aigocode.com/v1/chat/completions"
+        assert json["model"] == "gpt-5.4"
+        assert json["messages"] == [{"role": "user", "content": "ping"}]
+        assert json["stream"] is False
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat_1",
+                "model": "gpt-5.4",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/aigocode",
+        json={
+            "name": "AiGoCode",
+            "base_url": "https://api.aigocode.com/v1",
+            "api_key": "aigocode-key",
+            "default_model": "gpt-5.4",
+            "models": "gpt-5.4",
+        },
+    )
+    client.post("/admin/codex/config", json={"active_profile": "aigocode", "api_style": "chat"})
+
+    response = client.post("/admin/codex/protocol/check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["upstream"]["resolved_api_style"] == "chat"
+    assert body["upstream"]["protocol_url"] == "https://api.aigocode.com/v1/chat/completions"
+    assert body["upstream"]["model"] == "gpt-5.4"
+
+
+def test_codex_protocol_check_auto_falls_back_to_chat(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    calls = []
+
+    async def fake_post(self, url, headers, json):
+        calls.append(url)
+        if url.endswith("/responses"):
+            return httpx.Response(404, text="not found", headers={"content-type": "text/plain"})
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat_1",
+                "model": "gpt-5.4",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/aigocode",
+        json={
+            "name": "AiGoCode",
+            "base_url": "https://api.aigocode.com/v1",
+            "api_key": "aigocode-key",
+            "default_model": "gpt-5.4",
+            "models": "gpt-5.4",
+        },
+    )
+    client.post("/admin/codex/config", json={"active_profile": "aigocode", "api_style": "auto"})
+
+    response = client.post("/admin/codex/protocol/check")
+
+    assert response.status_code == 200
+    assert calls == [
+        "https://api.aigocode.com/v1/responses",
+        "https://api.aigocode.com/v1/chat/completions",
+    ]
+    body = response.json()
+    assert body["ok"] is True
+    assert body["upstream"]["resolved_api_style"] == "chat"
+    assert body["upstream"]["protocol_url"] == "https://api.aigocode.com/v1/chat/completions"
 
 
 def test_refresh_models_updates_active_profile(monkeypatch, tmp_path):
@@ -808,13 +1160,14 @@ def test_draft_protocol_check_does_not_change_active_profiles(monkeypatch, tmp_p
             "api_key": "draft-key",
             "default_model": "draft-model",
             "models": "draft-model",
-            "api_style": "chat",
         },
     )
 
     assert response.status_code == 200
     assert response.json()["ok"] is True
     assert response.json()["upstream"]["models_count"] == 1
+    assert "configured_api_style" not in response.json()["upstream"]
+    assert "resolved_api_style" not in response.json()["upstream"]
     assert client.get("/admin/config").json()["config"]["codex"]["active_profile"] == "codex"
 
 
@@ -836,12 +1189,36 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert 'setRefreshLoading' in text
     assert '正在刷新模型' in text
     assert "保存并生效" in text
-    assert "保存配置" in text
+    assert "保存映射" in text
     assert "修改Codex配置" in text
     assert "验证中..." in text
     assert "保存中..." in text
     assert "修改中..." in text
     assert "恢复中..." in text
+    assert 'id="checkCodexProtocol"' in text
+    assert 'id="checkClaudeProtocol"' in text
+    assert 'id="checkClaudeModel"' in text
+    assert 'id="codexProtocolStatus"' in text
+    assert 'id="claudeProtocolStatus"' in text
+    assert 'id="claudeModelStatus"' in text
+    assert 'id="claudeStatus"' in text
+    assert '.status:empty' in text
+    assert '.status-row' in text
+    assert "v1/responses" in text
+    assert "v1/chat/completions" in text
+    assert "v1/messages" in text
+    assert "Auto" in text
+    assert "验证模型" in text
+    assert "CodexProxy 配置" not in text
+    assert "ClaudeProxy Gateway 配置" not in text
+    assert "验证 ClaudeProxy" not in text
+    assert "Responses" not in text
+    assert "Chat Completions" not in text
+    assert "Anthropic Messages" not in text
+    assert "自动适配" not in text
+    assert text.count("选择中转平台") == 2
+    assert "Claude 使用的中转平台" not in text
+    assert "选择后自动生效。" in text
     assert 'datalist' not in text
 
 
@@ -864,7 +1241,6 @@ def test_protocol_check_reports_codex_and_upstream_contract(monkeypatch, tmp_pat
             "api_key": "uocode-key",
             "default_model": "model-a",
             "models": "model-a",
-            "api_style": "chat",
         },
     )
 
@@ -873,10 +1249,12 @@ def test_protocol_check_reports_codex_and_upstream_contract(monkeypatch, tmp_pat
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
-    assert body["codex_desktop"]["wire_api"] == "responses"
     assert body["codex_desktop"]["base_url"] == "http://127.0.0.1:8383/v1"
-    assert body["upstream"]["chat_completions_url"] == "https://www.uocode.com/v1/chat/completions"
     assert body["upstream"]["models_ok"] is True
+    assert body["upstream"]["models_url"] == "https://www.uocode.com/v1/models"
+    assert "configured_api_style" not in body["upstream"]
+    assert "resolved_api_style" not in body["upstream"]
+    assert "responses_url" not in body["upstream"]
 
 
 def test_protocol_check_reports_compact_upstream_html_error(monkeypatch, tmp_path):

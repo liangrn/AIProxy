@@ -52,7 +52,7 @@ def get_settings() -> Settings:
         upstream_api_key=profile["api_key"],
         upstream_model=profile["default_model"],
         upstream_models=profile["models"],
-        upstream_api_style=profile["api_style"],
+        upstream_api_style=config["codex"]["api_style"],
         upstream_user_agent=profile["user_agent"],
         request_timeout_seconds=float(profile["timeout_seconds"]),
         listen_host=os.getenv("LISTEN_HOST", "127.0.0.1"),
@@ -109,16 +109,16 @@ def normalize_models(value: Any) -> list[str]:
 
 
 def normalize_api_style(value: Any) -> str:
-    api_style = str(value or "chat").strip().lower()
+    api_style = str(value or "auto").strip().lower()
     if api_style not in {"auto", "chat", "responses"}:
-        return "chat"
+        return "auto"
     return api_style
 
 
 def normalize_claude_api_style(value: Any) -> str:
-    api_style = str(value or "anthropic").strip().lower()
+    api_style = str(value or "auto").strip().lower()
     if api_style not in {"anthropic", "chat", "auto"}:
-        return "anthropic"
+        return "auto"
     return api_style
 
 
@@ -193,7 +193,6 @@ def default_profile() -> dict[str, Any]:
             "api_key": os.getenv("UPSTREAM_API_KEY", ""),
             "default_model": upstream_model,
             "models": os.getenv("UPSTREAM_MODELS", f"{upstream_model},gpt-5.5,gpt-5.4"),
-            "api_style": os.getenv("UPSTREAM_API_STYLE", "chat"),
             "user_agent": os.getenv("UPSTREAM_USER_AGENT", DEFAULT_USER_AGENT),
             "timeout_seconds": os.getenv("REQUEST_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)),
         },
@@ -224,7 +223,6 @@ def normalize_profile(data: dict[str, Any], current: dict[str, Any] | None = Non
         "api_key": api_key,
         "default_model": default_model,
         "models": models,
-        "api_style": normalize_api_style(data.get("api_style") or data.get("upstream_api_style") or current.get("api_style") or current.get("upstream_api_style") or "chat"),
         "user_agent": str(data.get("user_agent") or data.get("upstream_user_agent") or current.get("user_agent") or current.get("upstream_user_agent") or DEFAULT_USER_AGENT).strip(),
         "timeout_seconds": float(data.get("timeout_seconds") or data.get("request_timeout_seconds") or current.get("timeout_seconds") or current.get("request_timeout_seconds") or DEFAULT_TIMEOUT_SECONDS),
     }
@@ -254,7 +252,10 @@ def normalized_runtime_config() -> dict[str, Any]:
             mappings = default_claude_model_mappings()
         return {
             "active_profile": codex_active,
-            "codex": {"active_profile": codex_active},
+            "codex": {
+                "active_profile": codex_active,
+                "api_style": normalize_api_style(codex_raw.get("api_style")),
+            },
             "claude": {
                 "active_profile": claude_active,
                 "api_style": normalize_claude_api_style(claude_raw.get("api_style")),
@@ -267,10 +268,13 @@ def normalized_runtime_config() -> dict[str, Any]:
     profile_id = profile_id_from_name(profile["name"])
     return {
         "active_profile": profile_id,
-        "codex": {"active_profile": profile_id},
+        "codex": {
+            "active_profile": profile_id,
+            "api_style": normalize_api_style(os.getenv("UPSTREAM_API_STYLE", "auto")),
+        },
         "claude": {
             "active_profile": profile_id,
-            "api_style": "anthropic",
+            "api_style": "auto",
             "model_mappings": default_claude_model_mappings(),
         },
         "profiles": {profile_id: profile},
@@ -297,7 +301,6 @@ def public_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "api_key": profile["api_key"],
         "default_model": profile["default_model"],
         "models": profile["models"],
-        "api_style": profile["api_style"],
         "user_agent": profile["user_agent"],
         "timeout_seconds": profile["timeout_seconds"],
     }
@@ -309,7 +312,10 @@ def public_settings(settings: Settings | None = None) -> dict[str, Any]:
     claude_settings = get_claude_settings()
     return {
         "active_profile": config["codex"]["active_profile"],
-        "codex": {"active_profile": config["codex"]["active_profile"]},
+        "codex": {
+            "active_profile": config["codex"]["active_profile"],
+            "api_style": config["codex"]["api_style"],
+        },
         "claude": {
             "active_profile": config["claude"]["active_profile"],
             "api_style": config["claude"]["api_style"],
@@ -335,13 +341,18 @@ def public_settings(settings: Settings | None = None) -> dict[str, Any]:
     }
 
 
-def save_runtime_config(data: dict[str, Any]) -> Settings:
+def save_codex_config(data: dict[str, Any]) -> dict[str, Any]:
     config = normalized_runtime_config()
-    active = config["codex"]["active_profile"]
-    config["profiles"][active] = normalize_profile(data, current=config["profiles"][active])
+    active = str(data.get("active_profile") or config["codex"]["active_profile"])
+    if active not in config["profiles"]:
+        raise KeyError(active)
+    config["codex"] = {
+        "active_profile": active,
+        "api_style": normalize_api_style(data.get("api_style") or config["codex"].get("api_style")),
+    }
     config["active_profile"] = active
     save_runtime_config_document(config)
-    return get_settings()
+    return public_settings()["codex"]
 
 
 def save_profile(profile_id: str, data: dict[str, Any], namespace: str = "codex") -> dict[str, Any]:

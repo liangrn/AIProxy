@@ -7,7 +7,12 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from .adapters import chat_completion_to_response, responses_to_chat_payload
+from .adapters import (
+    anthropic_messages_to_chat_payload,
+    chat_completion_to_anthropic_message,
+    chat_completion_to_response,
+    responses_to_chat_payload,
+)
 from .config import (
     activate_profile,
     get_claude_settings,
@@ -17,8 +22,8 @@ from .config import (
     public_settings,
     resolve_claude_model,
     save_claude_config,
+    save_codex_config,
     save_profile,
-    save_runtime_config,
     update_active_profile_models,
 )
 from .sse import chat_stream_to_responses_sse
@@ -107,18 +112,12 @@ async def check_profile_contract(profile: dict[str, Any], listen_host: str, list
         "ok": True,
         "codex_desktop": {
             "base_url": codex_base_url,
-            "wire_api": "responses",
-            "responses_url": f"{codex_base_url}/responses",
             "models_url": f"{codex_base_url}/models",
         },
         "upstream": {
             "provider": profile["name"],
             "base_url": profile["base_url"],
-            "configured_api_style": profile["api_style"],
-            "resolved_api_style": profile["api_style"],
             "models_url": f"{profile['base_url']}/models",
-            "responses_url": f"{profile['base_url']}/responses",
-            "chat_completions_url": f"{profile['base_url']}/chat/completions",
             "models_ok": True,
             "models_count": len(models),
         },
@@ -142,6 +141,11 @@ def claude_upstream_headers(request: Request, stream: bool) -> dict[str, str]:
         "User-Agent": settings.upstream_user_agent,
         "Accept": "text/event-stream" if stream else request.headers.get("accept", "application/json"),
     }
+    return headers
+
+
+def claude_messages_headers(request: Request, stream: bool) -> dict[str, str]:
+    headers = claude_upstream_headers(request, stream=stream)
     for header_name in ("anthropic-version", "anthropic-beta"):
         value = request.headers.get(header_name)
         if value:
@@ -165,22 +169,31 @@ async def create_claude_message(request: Request, payload: dict[str, Any]) -> di
     if not settings.upstream_api_key:
         raise HTTPException(status_code=500, detail="Claude upstream API key is not configured")
 
-    upstream_payload, claude_model, _ = mapped_claude_payload(payload)
-    url = f"{settings.upstream_base_url}/messages"
-    headers = claude_upstream_headers(request, stream=False)
+    upstream_payload, claude_model, upstream_model = mapped_claude_payload(payload)
     timeout = httpx.Timeout(settings.request_timeout_seconds)
     async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
-        response = await client.post(url, headers=headers, json=upstream_payload)
+        if settings.upstream_api_style in {"anthropic", "auto"}:
+            url = f"{settings.upstream_base_url}/messages"
+            response = await client.post(url, headers=claude_messages_headers(request, stream=False), json=upstream_payload)
+            if response.status_code < 400:
+                try:
+                    body = response.json()
+                except ValueError as exc:
+                    raise HTTPException(status_code=502, detail=f"Upstream returned non-JSON response: POST {url}") from exc
+                if not isinstance(body, dict):
+                    raise HTTPException(status_code=502, detail=f"Upstream returned unexpected JSON type for POST {url}")
+                body["model"] = claude_model
+                return body
+            if settings.upstream_api_style == "anthropic" or not is_unsupported_claude_messages_endpoint(response):
+                raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        chat_payload = anthropic_messages_to_chat_payload(payload, upstream_model, stream=False)
+        url = f"{settings.upstream_base_url}/chat/completions"
+        response = await client.post(url, headers=claude_upstream_headers(request, stream=False), json=chat_payload)
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
-    try:
-        body = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail=f"Upstream returned non-JSON response: POST {url}") from exc
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=502, detail=f"Upstream returned unexpected JSON type for POST {url}")
-    body["model"] = claude_model
-    return body
+        raise HTTPException(status_code=response.status_code, detail=summarize_upstream_error(response, url))
+    body = parse_upstream_json_response(response, url)
+    return chat_completion_to_anthropic_message(body, claude_model)
 
 
 async def stream_claude_message(request: Request, payload: dict[str, Any]):
@@ -188,33 +201,57 @@ async def stream_claude_message(request: Request, payload: dict[str, Any]):
     if not settings.upstream_api_key:
         raise HTTPException(status_code=500, detail="Claude upstream API key is not configured")
 
-    upstream_payload, _, _ = mapped_claude_payload(payload)
-    url = f"{settings.upstream_base_url}/messages"
-    headers = claude_upstream_headers(request, stream=True)
-    timeout = httpx.Timeout(settings.request_timeout_seconds)
-    client = httpx.AsyncClient(timeout=timeout, http2=True)
-    stream_context = client.stream("POST", url, headers=headers, json=upstream_payload)
-    try:
-        response = await stream_context.__aenter__()
-    except Exception:
-        await client.aclose()
-        raise
-    if response.status_code >= 400:
+    upstream_payload, _, upstream_model = mapped_claude_payload(payload)
+    if settings.upstream_api_style in {"anthropic", "auto"}:
+        url = f"{settings.upstream_base_url}/messages"
+        headers = claude_messages_headers(request, stream=True)
+        timeout = httpx.Timeout(settings.request_timeout_seconds)
+        client = httpx.AsyncClient(timeout=timeout, http2=True)
+        stream_context = client.stream("POST", url, headers=headers, json=upstream_payload)
+        try:
+            response = await stream_context.__aenter__()
+        except Exception:
+            await client.aclose()
+            raise
+        if response.status_code < 400:
+            async def iterator():
+                try:
+                    async for chunk in response.aiter_raw():
+                        if chunk:
+                            yield chunk
+                finally:
+                    await stream_context.__aexit__(None, None, None)
+                    await client.aclose()
+
+            return iterator()
+
         body = await response.aread()
         await stream_context.__aexit__(None, None, None)
         await client.aclose()
-        raise HTTPException(status_code=response.status_code, detail=body.decode("utf-8", "replace"))
+        error_detail = body.decode("utf-8", "replace")
+        if settings.upstream_api_style == "anthropic" or not is_unsupported_claude_messages_endpoint_body(response, error_detail):
+            raise HTTPException(status_code=response.status_code, detail=error_detail)
 
-    async def iterator():
-        try:
-            async for chunk in response.aiter_raw():
-                if chunk:
-                    yield chunk
-        finally:
-            await stream_context.__aexit__(None, None, None)
-            await client.aclose()
+    raise HTTPException(status_code=501, detail="Claude Chat Completions streaming is not supported yet")
 
-    return iterator()
+
+def is_unsupported_claude_messages_endpoint(response: httpx.Response) -> bool:
+    content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+    text = response.text.lower()
+    if response.status_code in {404, 405, 415, 501}:
+        return True
+    if content_type == "text/html":
+        return True
+    return "/v1/messages dispatch" in text
+
+
+def is_unsupported_claude_messages_endpoint_body(response: httpx.Response, body_text: str) -> bool:
+    content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+    if response.status_code in {404, 405, 415, 501}:
+        return True
+    if content_type == "text/html":
+        return True
+    return "/v1/messages dispatch" in body_text.lower()
 
 
 async def create_chat_completion(payload: dict[str, Any], stream: bool) -> dict[str, Any]:
@@ -306,6 +343,55 @@ def configured_or_cached_api_style(settings) -> str:
     return cached_resolved_api_style(settings) or "auto"
 
 
+async def check_codex_upstream_protocol() -> dict[str, Any]:
+    settings = get_settings()
+    codex_base_url = f"http://{settings.listen_host}:{settings.listen_port}/v1"
+    result: dict[str, Any] = {
+        "ok": False,
+        "codex_desktop": {
+            "base_url": codex_base_url,
+            "responses_url": f"{codex_base_url}/responses",
+        },
+        "upstream": {
+            "provider": settings.upstream_provider_name,
+            "base_url": settings.upstream_base_url,
+            "configured_api_style": settings.upstream_api_style,
+            "resolved_api_style": None,
+            "protocol_url": None,
+            "model": settings.upstream_model,
+        },
+    }
+
+    responses_payload = {"model": settings.upstream_model, "input": "ping", "max_output_tokens": 1, "stream": False}
+    if settings.upstream_api_style in {"responses", "auto"}:
+        try:
+            await create_upstream_response(responses_payload)
+            cache_resolved_api_style(settings, "responses")
+            result["ok"] = True
+            result["upstream"]["resolved_api_style"] = "responses"
+            result["upstream"]["protocol_url"] = f"{settings.upstream_base_url}/responses"
+            return result
+        except UpstreamProtocolUnsupported as exc:
+            if settings.upstream_api_style == "responses":
+                result["error"] = str(exc) or "Configured upstream responses endpoint is not supported"
+                return JSONResponse(result, status_code=502)
+        except HTTPException as exc:
+            result["error"] = exc.detail
+            return JSONResponse(result, status_code=exc.status_code)
+
+    chat_payload = responses_to_chat_payload(responses_payload, settings.upstream_model, stream=False)
+    try:
+        await create_chat_completion(chat_payload, stream=False)
+    except HTTPException as exc:
+        result["error"] = exc.detail
+        return JSONResponse(result, status_code=exc.status_code)
+    cache_resolved_api_style(settings, "chat")
+    result["ok"] = True
+    result["upstream"]["resolved_api_style"] = "chat"
+    result["upstream"]["protocol_url"] = f"{settings.upstream_base_url}/chat/completions"
+    return result
+
+
 async def stream_chat_completion(payload: dict[str, Any]):
     settings = get_settings()
     if not settings.upstream_api_key:
@@ -352,11 +438,14 @@ def create_app() -> FastAPI:
         settings = get_settings()
         return {"config": public_settings(settings), "resolved_api_style": cached_resolved_api_style(settings)}
 
-    @app.post("/admin/config")
-    async def update_admin_config(request: Request):
+    @app.post("/admin/codex/config")
+    async def update_admin_codex_config(request: Request):
         data = await request.json()
-        settings = save_runtime_config(data)
-        return {"ok": True, "config": public_settings(settings)}
+        try:
+            save_codex_config(data)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Profile not found: {exc.args[0]}") from exc
+        return {"ok": True, "config": public_settings()}
 
     @app.get("/admin/claude/config")
     async def admin_claude_config():
@@ -407,6 +496,9 @@ def create_app() -> FastAPI:
         settings = get_claude_settings()
         model = str((await request.json()).get("model") or settings.model_mappings[0]["claude_model"])
         payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}
+        endpoint = f"{settings.upstream_base_url}/messages"
+        if settings.upstream_api_style == "chat":
+            endpoint = f"{settings.upstream_base_url}/chat/completions"
         result: dict[str, Any] = {
             "ok": False,
             "claude_desktop": {
@@ -417,7 +509,7 @@ def create_app() -> FastAPI:
             "upstream": {
                 "provider": settings.upstream_provider_name,
                 "base_url": settings.upstream_base_url,
-                "messages_url": f"{settings.upstream_base_url}/messages",
+                "messages_url": endpoint,
                 "model": resolve_claude_model(model, settings.model_mappings),
             },
         }
@@ -430,6 +522,10 @@ def create_app() -> FastAPI:
         result["response_model"] = body.get("model")
         return result
 
+    @app.post("/admin/codex/protocol/check")
+    async def codex_protocol_check():
+        return await check_codex_upstream_protocol()
+
     @app.post("/admin/models/refresh")
     async def refresh_models():
         settings = get_settings()
@@ -439,7 +535,6 @@ def create_app() -> FastAPI:
             "api_key": settings.upstream_api_key,
             "default_model": settings.upstream_model,
             "models": settings.upstream_models,
-            "api_style": settings.upstream_api_style,
             "user_agent": settings.upstream_user_agent,
             "timeout_seconds": settings.request_timeout_seconds,
         }
@@ -455,18 +550,12 @@ def create_app() -> FastAPI:
             "ok": False,
             "codex_desktop": {
                 "base_url": codex_base_url,
-                "wire_api": "responses",
-                "responses_url": f"{codex_base_url}/responses",
                 "models_url": f"{codex_base_url}/models",
             },
             "upstream": {
                 "provider": settings.upstream_provider_name,
                 "base_url": settings.upstream_base_url,
-                "configured_api_style": settings.upstream_api_style,
-                "resolved_api_style": cached_resolved_api_style(settings),
                 "models_url": f"{settings.upstream_base_url}/models",
-                "responses_url": f"{settings.upstream_base_url}/responses",
-                "chat_completions_url": f"{settings.upstream_base_url}/chat/completions",
                 "models_ok": False,
                 "models_count": 0,
             },
@@ -502,30 +591,6 @@ def create_app() -> FastAPI:
         if not models:
             result["error"] = f"No models found in upstream response for GET {models_url}"
             return JSONResponse(result, status_code=502)
-
-        if settings.upstream_api_style == "auto":
-            probe_payload = {
-                "model": settings.upstream_model,
-                "input": "ping",
-                "max_output_tokens": 1,
-                "stream": False,
-            }
-            try:
-                probe = await create_upstream_response(probe_payload)
-                if probe.get("object") == "response":
-                    cache_resolved_api_style(settings, "responses")
-                    result["upstream"]["resolved_api_style"] = "responses"
-                else:
-                    cache_resolved_api_style(settings, "chat")
-                    result["upstream"]["resolved_api_style"] = "chat"
-            except UpstreamProtocolUnsupported:
-                cache_resolved_api_style(settings, "chat")
-                result["upstream"]["resolved_api_style"] = "chat"
-            except HTTPException as exc:
-                result["error"] = exc.detail
-                return JSONResponse(result, status_code=502)
-        else:
-            result["upstream"]["resolved_api_style"] = settings.upstream_api_style
         return result
 
     @app.get("/admin/codex/status")
@@ -662,15 +727,21 @@ ADMIN_HTML = """
     p { line-height: 1.55; color: #4b5563; }
     section { background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 20px; margin-top: 18px; }
     label { display: block; font-size: 13px; font-weight: 600; margin: 14px 0 6px; }
-    input, textarea, select { width: 100%; box-sizing: border-box; border: 1px solid #c7ced9; border-radius: 6px; padding: 10px 12px; font: inherit; background: #fff; }
-    textarea { min-height: 84px; resize: vertical; }
-    button { border: 0; border-radius: 6px; padding: 10px 14px; font: inherit; font-weight: 650; cursor: pointer; background: #1f6feb; color: #fff; }
+    input, textarea, select { width: 100%; height: 42px; box-sizing: border-box; border: 1px solid #c7ced9; border-radius: 6px; padding: 10px 12px; font: inherit; line-height: 20px; background: #fff; }
+    textarea { min-height: 84px; height: auto; resize: vertical; }
+    button { height: 42px; border: 0; border-radius: 6px; padding: 10px 14px; font: inherit; line-height: 20px; font-weight: 650; cursor: pointer; background: #1f6feb; color: #fff; }
+    .inline-control { height: 42px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: stretch; }
+    .inline-control select, .inline-control button { height: 42px; }
+    .inline-control button { margin: 0; white-space: nowrap; }
     button.secondary { background: #44546a; }
     button.danger { background: #b42318; }
     button:disabled { opacity: .45; cursor: not-allowed; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .status-row { margin-top: 12px; }
     .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
-    .status { min-height: 22px; margin-top: 12px; font-size: 14px; color: #255e2e; }
+    .status { font-size: 14px; color: #255e2e; }
+    .status:not(:empty) { margin-top: 12px; }
+    .status:empty { display: none; }
     .muted { color: #697386; font-size: 13px; }
     .tabs { display: flex; gap: 8px; margin-top: 18px; border-bottom: 1px solid #d9dee7; }
     .tab-button { background: transparent; color: #44546a; border-radius: 6px 6px 0 0; }
@@ -722,17 +793,6 @@ ADMIN_HTML = """
         <div><label for="provider">平台名称</label><input id="provider"></div>
         <div><label for="baseUrl">平台地址 <span class="muted">程序会自动补 `/v1`</span></label><input id="baseUrl" placeholder="https://www.uocode.com"></div>
       </div>
-      <div class="row">
-        <div>
-          <label for="apiStyle">上游协议</label>
-          <select id="apiStyle">
-            <option value="auto">自动适配</option>
-            <option value="chat">Chat Completions</option>
-            <option value="responses">Responses</option>
-          </select>
-        </div>
-        <div class="muted" style="align-self:end;">`auto` 会先尝试原生 Responses，不支持时回退到 Chat Completions。</div>
-      </div>
       <label for="apiKey">API Key</label>
       <input id="apiKey" placeholder="sk-...">
       <div class="row">
@@ -761,8 +821,27 @@ ADMIN_HTML = """
     </dialog>
 
     <section class="codex-panel">
-      <h2>CodexProxy 配置</h2>
-      <label for="profileSelect">当前配置</label><select id="profileSelect"></select>
+      <div class="row">
+        <div>
+          <label for="profileSelect">选择中转平台</label>
+          <select id="profileSelect"></select>
+        </div>
+        <div>
+          <label for="codexApiStyle">上游协议</label>
+          <div class="inline-control">
+            <select id="codexApiStyle">
+              <option value="auto">Auto</option>
+              <option value="chat">v1/chat/completions</option>
+              <option value="responses">v1/responses</option>
+            </select>
+            <button id="checkCodexProtocol" class="secondary" type="button">验证</button>
+          </div>
+        </div>
+      </div>
+      <p class="muted">选择后自动生效。</p>
+      <div class="status-row">
+        <div id="codexProtocolStatus" class="status"></div>
+      </div>
     </section>
 
     <section class="codex-panel">
@@ -784,31 +863,45 @@ ADMIN_HTML = """
     </section>
 
     <section class="claude-panel panel-hidden">
-      <h2>ClaudeProxy Gateway 配置</h2>
       <div class="row">
         <div>
-          <label for="claudeProfileSelect">Claude 使用的中转平台</label>
+          <label for="claudeProfileSelect">选择中转平台</label>
           <select id="claudeProfileSelect"></select>
         </div>
         <div>
           <label for="claudeApiStyle">上游协议</label>
-          <select id="claudeApiStyle">
-            <option value="anthropic">Anthropic Messages</option>
-            <option value="chat">Chat Completions</option>
-            <option value="auto">自动适配</option>
-          </select>
+          <div class="inline-control">
+            <select id="claudeApiStyle">
+              <option value="anthropic">v1/messages</option>
+              <option value="chat">v1/chat/completions</option>
+              <option value="auto">Auto</option>
+            </select>
+            <button id="checkClaudeProtocol" class="secondary" type="button">验证</button>
+          </div>
         </div>
       </div>
-      <p class="muted">Claude Desktop Developer Mode 的 Gateway URL 填：<code id="claudeGatewayUrl"></code>。API Key 可填任意非空值，代理会使用所选中转平台的 API Key。</p>
+      <div class="status-row">
+        <div id="claudeProtocolStatus" class="status"></div>
+      </div>
+      <p class="muted">选择后自动生效。</p>
+      <p class="muted">Claude Desktop Developer Mode 的 Gateway URL填：<code id="claudeGatewayUrl"></code>。API Key可填任意非空值。</p>
       <label>模型映射</label>
       <div id="mappingRows"></div>
       <div class="actions">
         <button id="addMapping" class="secondary" type="button">添加映射</button>
-        <button id="saveClaudeConfig" type="button">保存配置</button>
+        <button id="saveClaudeConfig" type="button">保存映射</button>
       </div>
       <div class="row">
-        <div><label for="claudeTestModel">验证模型名</label><input id="claudeTestModel" placeholder="claude-opus-4.6"></div>
-        <div><label>&nbsp;</label><button id="checkClaudeProtocol" class="secondary" type="button">验证 ClaudeProxy</button></div>
+        <div>
+          <label for="claudeTestModel">验证模型名</label>
+          <div class="inline-control">
+            <input id="claudeTestModel" placeholder="claude-opus-4.6">
+            <button id="checkClaudeModel" class="secondary" type="button">验证模型</button>
+          </div>
+        </div>
+      </div>
+      <div class="status-row">
+        <div id="claudeModelStatus" class="status"></div>
       </div>
       <div id="claudeStatus" class="status"></div>
     </section>
@@ -849,7 +942,6 @@ ADMIN_HTML = """
         name: $('provider').value,
         base_url: $('baseUrl').value,
         api_key: $('apiKey').value,
-        api_style: $('apiStyle').value,
         default_model: $('defaultModel').value,
         models: currentModels,
         user_agent: $('userAgent').value || 'curl/8.7.1',
@@ -866,7 +958,6 @@ ADMIN_HTML = """
         $('provider').value = '';
         $('baseUrl').value = '';
         $('apiKey').value = '';
-        $('apiStyle').value = 'auto';
         $('defaultModel').value = '';
         currentModels = [];
         renderModelMenu();
@@ -887,7 +978,6 @@ ADMIN_HTML = """
       $('provider').value = profile.name;
       $('baseUrl').value = profile.base_url;
       $('apiKey').value = profile.api_key || '';
-      $('apiStyle').value = profile.api_style || 'auto';
       $('defaultModel').value = profile.default_model;
       currentModels = profile.models || [];
       renderModelMenu();
@@ -901,11 +991,11 @@ ADMIN_HTML = """
       for (const [profileId, profile] of Object.entries(currentConfig.profiles)) {
         const option = document.createElement('option');
         option.value = profileId;
-        option.textContent = profileId === currentConfig.claude.active_profile ? `${profile.name}（Claude 当前）` : profile.name;
+        option.textContent = profileId === currentConfig.claude.active_profile ? `${profile.name}（当前）` : profile.name;
         $('claudeProfileSelect').appendChild(option);
       }
       $('claudeProfileSelect').value = currentConfig.claude.active_profile;
-      $('claudeApiStyle').value = currentConfig.claude.api_style || 'anthropic';
+      $('claudeApiStyle').value = currentConfig.claude.api_style || 'auto';
       $('claudeGatewayUrl').textContent = currentConfig.claude.base_url;
       currentMappings = (currentConfig.claude.model_mappings || []).map((mapping) => ({ ...mapping }));
       if (currentMappings.length && !$('claudeTestModel').value) {
@@ -1005,11 +1095,12 @@ ADMIN_HTML = """
       for (const [profileId, profile] of Object.entries(config.profiles)) {
         const option = document.createElement('option');
         option.value = profileId;
-        option.textContent = profileId === config.active_profile ? `${profile.name}（当前）` : profile.name;
+        option.textContent = profileId === config.codex.active_profile ? `${profile.name}（当前）` : profile.name;
         $('profileSelect').appendChild(option);
       }
-      $('profileSelect').value = config.active_profile;
-      fillProfile(config.active_profile);
+      $('profileSelect').value = config.codex.active_profile;
+      $('codexApiStyle').value = config.codex.api_style || 'auto';
+      fillProfile(config.codex.active_profile);
       renderClaudeProfiles();
       $('proxyUrl').value = `http://${config.listen_host}:${config.listen_port}`;
 
@@ -1020,15 +1111,20 @@ ADMIN_HTML = """
       $('restoreCodex').disabled = !codex.backup_available;
     }
 
-    $('profileSelect').onchange = async () => {
-      const profileId = $('profileSelect').value;
-      const res = await fetch(`/admin/profiles/${encodeURIComponent(profileId)}/activate`, { method: 'POST' });
-      $('configStatus').textContent = res.ok ? '已切换当前生效配置。' : '切换失败';
+    async function saveCodexConfig(statusText) {
+      $('codexProtocolStatus').textContent = statusText;
+      const payload = {
+        active_profile: $('profileSelect').value,
+        api_style: $('codexApiStyle').value
+      };
+      const res = await fetch('/admin/codex/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const body = await res.json();
+      $('codexProtocolStatus').textContent = res.ok ? 'Codex 当前配置已生效。' : `切换失败：${body.detail}`;
       await refresh();
-    };
+    }
 
-    $('claudeProfileSelect').onchange = async () => {
-      $('claudeStatus').textContent = '正在切换 ClaudeProxy 当前配置，请稍候。';
+    async function saveClaudeSelection(statusText) {
+      $('claudeStatus').textContent = statusText;
       const payload = {
         active_profile: $('claudeProfileSelect').value,
         api_style: $('claudeApiStyle').value,
@@ -1036,8 +1132,24 @@ ADMIN_HTML = """
       };
       const res = await fetch('/admin/claude/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const body = await res.json();
-      $('claudeStatus').textContent = res.ok ? 'ClaudeProxy 当前配置已切换。' : `切换失败：${body.detail}`;
+      $('claudeStatus').textContent = res.ok ? 'ClaudeProxy 当前配置已生效。' : `切换失败：${body.detail}`;
       await refresh();
+    }
+
+    $('profileSelect').onchange = async () => {
+      await saveCodexConfig('正在切换 Codex 当前配置，请稍候。');
+    };
+
+    $('codexApiStyle').onchange = async () => {
+      await saveCodexConfig('正在切换 Codex 上游协议，请稍候。');
+    };
+
+    $('claudeProfileSelect').onchange = async () => {
+      await saveClaudeSelection('正在切换 ClaudeProxy 当前配置，请稍候。');
+    };
+
+    $('claudeApiStyle').onchange = async () => {
+      await saveClaudeSelection('正在切换 ClaudeProxy 上游协议，请稍候。');
     };
 
     $('codexTabButton').onclick = () => showTab('codex');
@@ -1093,7 +1205,7 @@ ADMIN_HTML = """
         const res = await fetch('/admin/profiles/draft/protocol/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(profilePayloadFromDialog()) });
         const body = await res.json();
         if (res.ok && body.ok) {
-          $('configStatus').textContent = `验证通过：Codex Desktop 使用 Responses，本地地址 ${body.codex_desktop.base_url}；上游模型接口返回 ${body.upstream.models_count} 个模型；上游协议配置为 ${body.upstream.configured_api_style}。`;
+          $('configStatus').textContent = `验证通过：本地地址 ${body.codex_desktop.base_url}；上游模型接口返回 ${body.upstream.models_count} 个模型。`;
         } else {
           $('configStatus').textContent = `验证失败：${body.error || '上游模型接口未返回模型'}`;
         }
@@ -1101,6 +1213,25 @@ ADMIN_HTML = """
         $('configStatus').textContent = `验证失败：${error.message}`;
       } finally {
         setButtonLoading(button, false, '验证中...', '验证配置');
+      }
+    };
+
+    $('checkCodexProtocol').onclick = async () => {
+      const button = $('checkCodexProtocol');
+      setButtonLoading(button, true, '验证中...', '验证');
+      $('codexProtocolStatus').textContent = '正在验证 Codex 上游协议，请稍候。';
+      try {
+        const res = await fetch('/admin/codex/protocol/check', { method: 'POST' });
+        const body = await res.json();
+        if (res.ok && body.ok) {
+          $('codexProtocolStatus').textContent = `验证通过：${body.upstream.provider} 使用 ${body.upstream.resolved_api_style}；上游 ${body.upstream.protocol_url}；模型 ${body.upstream.model}。`;
+        } else {
+          $('codexProtocolStatus').textContent = `验证失败：${body.error || '请求失败'}`;
+        }
+      } catch (error) {
+        $('codexProtocolStatus').textContent = `验证失败：${error.message}`;
+      } finally {
+        setButtonLoading(button, false, '验证中...', '验证');
       }
     };
 
@@ -1143,8 +1274,8 @@ ADMIN_HTML = """
 
     $('saveClaudeConfig').onclick = async () => {
       const button = $('saveClaudeConfig');
-      setButtonLoading(button, true, '保存中...', '保存配置');
-      $('claudeStatus').textContent = '正在保存 ClaudeProxy 配置，请稍候。';
+      setButtonLoading(button, true, '保存中...', '保存映射');
+      $('claudeStatus').textContent = '正在保存 ClaudeProxy 模型映射，请稍候。';
       try {
         const payload = {
           active_profile: $('claudeProfileSelect').value,
@@ -1153,31 +1284,50 @@ ADMIN_HTML = """
         };
         const res = await fetch('/admin/claude/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         const body = await res.json();
-        $('claudeStatus').textContent = res.ok ? '保存成功，ClaudeProxy 配置已生效。' : `保存失败：${body.detail}`;
+        $('claudeStatus').textContent = res.ok ? '保存成功，ClaudeProxy 模型映射已生效。' : `保存失败：${body.detail}`;
         await refresh();
       } catch (error) {
         $('claudeStatus').textContent = `保存失败：${error.message}`;
       } finally {
-        setButtonLoading(button, false, '保存中...', '保存配置');
+        setButtonLoading(button, false, '保存中...', '保存映射');
       }
     };
 
     $('checkClaudeProtocol').onclick = async () => {
       const button = $('checkClaudeProtocol');
-      setButtonLoading(button, true, '验证中...', '验证 ClaudeProxy');
-      $('claudeStatus').textContent = '正在验证 ClaudeProxy，请稍候。';
+      setButtonLoading(button, true, '验证中...', '验证');
+      $('claudeProtocolStatus').textContent = '正在验证 Claude 上游协议，请稍候。';
+      try {
+        const res = await fetch('/admin/claude/protocol/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+        const body = await res.json();
+        if (res.ok && body.ok) {
+          $('claudeProtocolStatus').textContent = `验证通过：Gateway ${body.claude_desktop.base_url}；上游 ${body.upstream.messages_url}。`;
+        } else {
+          $('claudeProtocolStatus').textContent = `验证失败：${body.error || '请求失败'}`;
+        }
+      } catch (error) {
+        $('claudeProtocolStatus').textContent = `验证失败：${error.message}`;
+      } finally {
+        setButtonLoading(button, false, '验证中...', '验证');
+      }
+    };
+
+    $('checkClaudeModel').onclick = async () => {
+      const button = $('checkClaudeModel');
+      setButtonLoading(button, true, '验证中...', '验证模型');
+      $('claudeModelStatus').textContent = '正在验证 Claude 模型，请稍候。';
       try {
         const res = await fetch('/admin/claude/protocol/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: $('claudeTestModel').value }) });
         const body = await res.json();
         if (res.ok && body.ok) {
-          $('claudeStatus').textContent = `验证通过：Gateway ${body.claude_desktop.base_url}；上游 ${body.upstream.messages_url}；模型映射到 ${body.upstream.model}。`;
+          $('claudeModelStatus').textContent = `验证通过：Gateway ${body.claude_desktop.base_url}；上游 ${body.upstream.messages_url}；模型映射到 ${body.upstream.model}。`;
         } else {
-          $('claudeStatus').textContent = `验证失败：${body.error || '请求失败'}`;
+          $('claudeModelStatus').textContent = `验证失败：${body.error || '请求失败'}`;
         }
       } catch (error) {
-        $('claudeStatus').textContent = `验证失败：${error.message}`;
+        $('claudeModelStatus').textContent = `验证失败：${error.message}`;
       } finally {
-        setButtonLoading(button, false, '验证中...', '验证 ClaudeProxy');
+        setButtonLoading(button, false, '验证中...', '验证模型');
       }
     };
 

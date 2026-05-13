@@ -10,7 +10,7 @@ AIProxy 是给 Codex Desktop 和 Claude Desktop 使用的本地中转代理。
 - 默认示例支持 `gpt-5.5` 和 `gpt-5.4`。
 - 支持非流式 `/v1/responses`。
 - 支持流式 `/v1/responses`，尾部会补齐 `response.completed` 和 `[DONE]`。
-- 支持为每个平台单独配置上游协议类型：`chat`、`responses`、`auto`。
+- 支持在 Codex 和 Claude 页面分别配置各自的上游协议。
 - 提供 `/healthz` 健康检查。
 - 提供本地管理页，可动态设置多个中转平台、刷新模型并切换当前生效配置。
 - 提供 Codex Desktop 配置安装和恢复脚本。
@@ -95,13 +95,14 @@ http://127.0.0.1:8383/
 
 如果要自定义运行时配置文件路径，可以设置 `AIPROXY_CONFIG_PATH`。旧的 `CODEXPROXY_CONFIG_PATH` 仍然兼容，但新配置建议使用 `AIPROXY_CONFIG_PATH`。
 
-管理页支持多个共享中转配置，例如 UoCode、AiCoeGo 和字节跳动。CodexProxy 和 ClaudeProxy 会分别选择自己的当前配置，互不影响。
+管理页支持多个共享中转配置，例如 UoCode、AiCoeGo 和字节跳动。Codex 和 Claude 会分别选择自己的当前配置，互不影响。
 
-每个平台还可以配置“上游协议”：
+Codex 页和 Claude 页会分别配置各自的“上游协议”：
 
-- `chat`：固定走 `{平台地址}/v1/chat/completions`
-- `responses`：固定走 `{平台地址}/v1/responses`
-- `auto`：优先尝试原生 `responses`，不支持时回退到 `chat/completions`
+- `v1/chat/completions`：固定走 `{平台地址}/v1/chat/completions`
+- `v1/responses`：固定走 `{平台地址}/v1/responses`
+- `Auto`：Codex 优先尝试原生 `responses`，Claude 优先尝试 `messages`，不支持时回退到 `chat/completions`
+- `v1/messages`：Claude 固定透传 `{平台地址}/messages`
 
 管理页的模型流程：
 
@@ -110,11 +111,10 @@ http://127.0.0.1:8383/
 - 刷新成功后，默认模型输入框会变成可输入过滤的模型选择框。
 - 选择默认模型并保存后，新请求会立即使用这个模型。
 
-管理页提供“验证配置”按钮，用来检查两件事：
+管理页提供“验证配置”按钮，用来检查平台模型接口是否可用：
 
-- Codex Desktop 侧使用本地 `http://127.0.0.1:8383/v1`，协议是 `wire_api = "responses"`。
-- 上游平台侧固定使用 `{平台地址}/v1/models` 读取模型。
-- 请求协议根据配置决定使用 `{平台地址}/v1/responses` 或 `{平台地址}/v1/chat/completions`。
+- 本地代理地址会显示为 `http://127.0.0.1:8383/v1`。
+- 上游平台侧固定使用 `{平台地址}/v1/models` 读取模型并统计模型数量。
 
 API Key 会直接显示在管理页中，方便本机维护配置。不要把管理页监听到公网或局域网。
 
@@ -281,7 +281,7 @@ Model: claude-opus-4.6
 
 ClaudeProxy 不会修改 Claude Desktop 的本地配置文件；它只在管理页里显示应填写的 Gateway URL，并提供连通性验证。
 
-ClaudeProxy 和 CodexProxy 共享中转平台列表，但当前生效平台互相独立。可以让 CodexProxy 使用 UoCode，同时让 ClaudeProxy 使用“字节跳动”。
+Claude 和 Codex 共享中转平台列表，但当前生效平台互相独立。可以让 Codex 使用 UoCode，同时让 Claude 使用“字节跳动”。
 
 管理页的 ClaudeProxy Tab 支持配置模型映射，例如：
 

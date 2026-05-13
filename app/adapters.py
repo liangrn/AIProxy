@@ -65,6 +65,83 @@ def assistant_message_text(message: dict[str, Any]) -> str:
     return ""
 
 
+def anthropic_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and part.get("text"):
+                parts.append(str(part["text"]))
+        return "\n".join(parts)
+    return "" if content is None else str(content)
+
+
+def anthropic_messages_to_chat_payload(payload: dict[str, Any], upstream_model: str, stream: bool) -> dict[str, Any]:
+    messages: list[dict[str, str]] = []
+    system = payload.get("system")
+    system_text = anthropic_content_to_text(system)
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+
+    for message in payload.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        messages.append(
+            {
+                "role": str(message.get("role") or "user"),
+                "content": anthropic_content_to_text(message.get("content")),
+            }
+        )
+
+    chat_payload: dict[str, Any] = {
+        "model": upstream_model,
+        "messages": messages,
+        "stream": stream,
+    }
+    if "max_tokens" in payload:
+        chat_payload["max_tokens"] = payload["max_tokens"]
+    for key in ("temperature", "top_p", "stop"):
+        if key in payload:
+            chat_payload[key] = payload[key]
+    return chat_payload
+
+
+def chat_finish_reason_to_claude_stop_reason(reason: Any) -> str | None:
+    if reason == "stop":
+        return "end_turn"
+    if reason == "length":
+        return "max_tokens"
+    if reason == "tool_calls":
+        return "tool_use"
+    return None
+
+
+def chat_completion_to_anthropic_message(chat: dict[str, Any], requested_model: str) -> dict[str, Any]:
+    choice = (chat.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    text = assistant_message_text(message)
+    usage = responses_usage(chat.get("usage"))
+    return {
+        "id": chat.get("id") or make_message_id(),
+        "type": "message",
+        "role": "assistant",
+        "model": requested_model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": chat_finish_reason_to_claude_stop_reason(choice.get("finish_reason")),
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+        },
+    }
+
+
 def responses_to_chat_payload(payload: dict[str, Any], default_model: str, stream: bool) -> dict[str, Any]:
     chat_payload: dict[str, Any] = {
         "model": payload.get("model") or default_model,
