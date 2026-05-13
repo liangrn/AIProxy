@@ -180,10 +180,10 @@ def test_admin_codex_desktop_install_openai_compatible_mode_is_rejected(monkeypa
 
     client = TestClient(create_app())
     client.post(
-        "/admin/profiles/uocode",
+        "/admin/profiles/example-provider",
         json={
-            "name": "UoCode",
-            "base_url": "https://www.uocode.com",
+            "name": "Example Provider",
+            "base_url": "https://example.com",
             "api_key": "key",
             "default_model": "gpt-5.5",
             "models": "gpt-5.5",

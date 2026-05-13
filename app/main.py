@@ -891,7 +891,7 @@ ADMIN_HTML = """
         </div>
       <div class="row">
         <div><label for="provider">平台名称</label><input id="provider"></div>
-        <div><label for="baseUrl">平台地址 <span class="muted">程序会自动补 `/v1`</span></label><input id="baseUrl" placeholder="https://www.uocode.com"></div>
+        <div><label for="baseUrl">平台地址 <span class="muted">程序会自动补 `/v1`</span></label><input id="baseUrl" placeholder="https://example.com"></div>
       </div>
       <label for="apiKey">API Key</label>
       <input id="apiKey" placeholder="sk-...">
