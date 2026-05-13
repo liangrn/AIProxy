@@ -140,7 +140,7 @@ def claude_upstream_headers(request: Request, stream: bool) -> dict[str, str]:
         "Authorization": f"Bearer {settings.upstream_api_key}",
         "Content-Type": "application/json",
         "User-Agent": settings.upstream_user_agent,
-        "Accept": "text/event-stream" if stream else request.headers.get("accept", "application/json"),
+        "Accept": "text/event-stream" if stream else "application/json",
     }
     return headers
 
@@ -1109,8 +1109,6 @@ ADMIN_HTML = """
 
       picker.render = () => {
         const models = getModels();
-        const query = input.value.trim().toLowerCase();
-        const visibleModels = query ? models.filter((model) => model.toLowerCase().includes(query)) : models;
         menu.innerHTML = '';
         if (!models.length) {
           const empty = document.createElement('div');
@@ -1119,14 +1117,7 @@ ADMIN_HTML = """
           menu.appendChild(empty);
           return;
         }
-        if (!visibleModels.length) {
-          const empty = document.createElement('div');
-          empty.className = 'model-empty';
-          empty.textContent = '没有匹配的模型';
-          menu.appendChild(empty);
-          return;
-        }
-        for (const model of visibleModels) {
+        for (const model of models) {
           const option = document.createElement('button');
           option.type = 'button';
           option.className = 'model-option' + (model === getValue() ? ' active' : '');

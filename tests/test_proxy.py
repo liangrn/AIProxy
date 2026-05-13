@@ -1037,6 +1037,57 @@ def test_claude_protocol_check_reports_auto_fallback_for_non_json_messages(monke
     assert body["upstream"]["fallback_reason"] == "v1/messages did not return Anthropic JSON"
 
 
+def test_claude_protocol_check_forces_json_accept_header(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    captured = {}
+
+    async def fake_post(self, url, headers, json):
+        captured["url"] = url
+        captured["headers"] = headers
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "glm-5.1",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/uocode",
+        json={
+            "name": "UoCode",
+            "base_url": "https://www.uocode.com/v1",
+            "api_key": "uocode-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "uocode",
+            "api_style": "auto",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post("/admin/claude/protocol/check", json={"model": "claude-opus-4.6"}, headers={"accept": "*/*"})
+
+    assert response.status_code == 200
+    assert captured["url"] == "https://www.uocode.com/v1/messages"
+    assert captured["headers"]["Accept"] == "application/json"
+
+
 def test_admin_config_exposes_api_style(monkeypatch, tmp_path):
     config_path = tmp_path / "config.local.json"
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
@@ -1469,8 +1520,8 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert 'id="claudeStatus"' in text
     assert '.status:empty' in text
     assert '.status-row' in text
-    assert 'query = input.value.trim().toLowerCase();' in text
-    assert "models.filter((model) => model.toLowerCase().includes(query))" in text
+    assert 'query = input.value.trim().toLowerCase();' not in text
+    assert "models.filter((model) => model.toLowerCase().includes(query))" not in text
     assert "try {" in text
     assert "finally {" in text
     assert "v1/responses" in text
@@ -1488,7 +1539,7 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert "Claude 使用的中转平台" not in text
     assert "选择后自动生效。" in text
     assert text.count("选择后自动生效。") == 2
-    assert "没有匹配的模型" in text
+    assert "没有匹配的模型" not in text
     assert 'datalist' not in text
     dialog = text.split('<dialog id="profileDialog">', 1)[1].split("</dialog>", 1)[0]
     assert "默认模型" not in dialog
