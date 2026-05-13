@@ -166,7 +166,7 @@ def resolve_claude_model(model: str, mappings: list[dict[str, str]]) -> str | No
 def normalize_base_url(value: str) -> str:
     base_url = value.strip().rstrip("/")
     if not base_url:
-        return "https://www.uocode.com/v1"
+        return "https://example.com/v1"
     if base_url.endswith("/v1"):
         return base_url
     return f"{base_url}/v1"
@@ -189,7 +189,7 @@ def default_profile() -> dict[str, Any]:
     return normalize_profile(
         {
             "name": os.getenv("UPSTREAM_PROVIDER_NAME", "openai-compatible"),
-            "base_url": os.getenv("UPSTREAM_BASE_URL", "https://www.uocode.com/v1"),
+            "base_url": os.getenv("UPSTREAM_BASE_URL", "https://example.com/v1"),
             "api_key": os.getenv("UPSTREAM_API_KEY", ""),
             "default_model": upstream_model,
             "models": os.getenv("UPSTREAM_MODELS", f"{upstream_model},gpt-5.5,gpt-5.4"),
@@ -219,7 +219,7 @@ def normalize_profile(data: dict[str, Any], current: dict[str, Any] | None = Non
 
     return {
         "name": str(data.get("name") or data.get("upstream_provider_name") or current.get("name") or current.get("upstream_provider_name") or "openai-compatible").strip(),
-        "base_url": normalize_base_url(str(data.get("base_url") or data.get("upstream_base_url") or current.get("base_url") or current.get("upstream_base_url") or "https://www.uocode.com/v1")),
+        "base_url": normalize_base_url(str(data.get("base_url") or data.get("upstream_base_url") or current.get("base_url") or current.get("upstream_base_url") or "https://example.com/v1")),
         "api_key": api_key,
         "default_model": default_model,
         "models": models,

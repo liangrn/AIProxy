@@ -371,13 +371,13 @@ def test_admin_profiles_switch_active_profile_and_normalize_base_url(monkeypatch
 
     client = TestClient(create_app())
     first = client.post(
-        "/admin/profiles/uocode",
+        "/admin/profiles/example-provider",
         json={
-            "name": "UoCode",
-            "base_url": "https://www.uocode.com",
-            "api_key": "uocode-key",
-            "default_model": "uocode-default",
-            "models": "uocode-default,uocode-fast",
+            "name": "Example Provider",
+            "base_url": "https://example.com",
+            "api_key": "example-key",
+            "default_model": "example-default",
+            "models": "example-default,example-fast",
         },
     )
     second = client.post(
@@ -393,7 +393,7 @@ def test_admin_profiles_switch_active_profile_and_normalize_base_url(monkeypatch
     activate = client.post("/admin/profiles/aicoego/activate")
 
     assert first.status_code == 200
-    assert first.json()["profile"]["base_url"] == "https://www.uocode.com"
+    assert first.json()["profile"]["base_url"] == "https://example.com"
     assert second.status_code == 200
     assert second.json()["profile"]["base_url"] == "https://aicoego.example"
     assert activate.status_code == 200
@@ -416,6 +416,15 @@ def test_admin_profiles_switch_active_profile_and_normalize_base_url(monkeypatch
         {"id": "aicoego-default", "object": "model", "owned_by": "AiCoeGo"},
         {"id": "aicoego-long", "object": "model", "owned_by": "AiCoeGo"},
     ]
+
+
+def test_default_base_url_uses_generic_example_domain(monkeypatch, tmp_path):
+    monkeypatch.delenv("UPSTREAM_BASE_URL", raising=False)
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
+
+    settings = get_settings()
+
+    assert settings.upstream_base_url == "https://example.com/v1"
 
 
 def test_claude_active_profile_is_independent_from_codex(monkeypatch, tmp_path):
@@ -676,11 +685,11 @@ def test_claude_auto_protocol_falls_back_to_chat_when_messages_returns_non_json(
 
     client = TestClient(create_app())
     client.post(
-        "/admin/profiles/uocode",
+        "/admin/profiles/example-provider",
         json={
-            "name": "UoCode",
-            "base_url": "https://www.uocode.com/v1",
-            "api_key": "uocode-key",
+            "name": "Example Provider",
+            "base_url": "https://example.com/v1",
+            "api_key": "example-key",
             "default_model": "glm-5.1",
             "models": "glm-5.1",
         },
@@ -688,7 +697,7 @@ def test_claude_auto_protocol_falls_back_to_chat_when_messages_returns_non_json(
     client.post(
         "/admin/claude/config",
         json={
-            "active_profile": "uocode",
+            "active_profile": "example-provider",
             "api_style": "auto",
             "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
         },
@@ -705,8 +714,8 @@ def test_claude_auto_protocol_falls_back_to_chat_when_messages_returns_non_json(
 
     assert response.status_code == 200
     assert calls == [
-        "https://www.uocode.com/v1/messages",
-        "https://www.uocode.com/v1/chat/completions",
+        "https://example.com/v1/messages",
+        "https://example.com/v1/chat/completions",
     ]
     assert response.json()["content"] == [{"type": "text", "text": "fallback ok"}]
 
@@ -1005,11 +1014,11 @@ def test_claude_protocol_check_reports_auto_fallback_for_non_json_messages(monke
 
     client = TestClient(create_app())
     client.post(
-        "/admin/profiles/uocode",
+        "/admin/profiles/example-provider",
         json={
-            "name": "UoCode",
-            "base_url": "https://www.uocode.com/v1",
-            "api_key": "uocode-key",
+            "name": "Example Provider",
+            "base_url": "https://example.com/v1",
+            "api_key": "example-key",
             "default_model": "glm-5.1",
             "models": "glm-5.1",
         },
@@ -1017,7 +1026,7 @@ def test_claude_protocol_check_reports_auto_fallback_for_non_json_messages(monke
     client.post(
         "/admin/claude/config",
         json={
-            "active_profile": "uocode",
+            "active_profile": "example-provider",
             "api_style": "auto",
             "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
         },
@@ -1027,13 +1036,13 @@ def test_claude_protocol_check_reports_auto_fallback_for_non_json_messages(monke
 
     assert response.status_code == 200
     assert calls == [
-        "https://www.uocode.com/v1/messages",
-        "https://www.uocode.com/v1/chat/completions",
+        "https://example.com/v1/messages",
+        "https://example.com/v1/chat/completions",
     ]
     body = response.json()
     assert body["ok"] is True
     assert body["upstream"]["resolved_api_style"] == "chat"
-    assert body["upstream"]["messages_url"] == "https://www.uocode.com/v1/chat/completions"
+    assert body["upstream"]["messages_url"] == "https://example.com/v1/chat/completions"
     assert body["upstream"]["fallback_reason"] == "v1/messages did not return Anthropic JSON"
 
 
@@ -1063,11 +1072,11 @@ def test_claude_protocol_check_uses_submitted_model_mappings(monkeypatch, tmp_pa
 
     client = TestClient(create_app())
     client.post(
-        "/admin/profiles/uocode",
+        "/admin/profiles/example-provider",
         json={
-            "name": "UoCode",
-            "base_url": "https://www.uocode.com/v1",
-            "api_key": "uocode-key",
+            "name": "Example Provider",
+            "base_url": "https://example.com/v1",
+            "api_key": "example-key",
             "default_model": "glm-5.1",
             "models": "glm-5.1",
         },
@@ -1075,7 +1084,7 @@ def test_claude_protocol_check_uses_submitted_model_mappings(monkeypatch, tmp_pa
     client.post(
         "/admin/claude/config",
         json={
-            "active_profile": "uocode",
+            "active_profile": "example-provider",
             "api_style": "anthropic",
             "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "old-model"}],
         },
@@ -1090,7 +1099,7 @@ def test_claude_protocol_check_uses_submitted_model_mappings(monkeypatch, tmp_pa
     )
 
     assert response.status_code == 200
-    assert captured["url"] == "https://www.uocode.com/v1/messages"
+    assert captured["url"] == "https://example.com/v1/messages"
     assert captured["payload"]["model"] == "glm-5.1"
     body = response.json()
     assert body["ok"] is True
@@ -1123,11 +1132,11 @@ def test_claude_protocol_check_forces_json_accept_header(monkeypatch, tmp_path):
 
     client = TestClient(create_app())
     client.post(
-        "/admin/profiles/uocode",
+        "/admin/profiles/example-provider",
         json={
-            "name": "UoCode",
-            "base_url": "https://www.uocode.com/v1",
-            "api_key": "uocode-key",
+            "name": "Example Provider",
+            "base_url": "https://example.com/v1",
+            "api_key": "example-key",
             "default_model": "glm-5.1",
             "models": "glm-5.1",
         },
@@ -1135,7 +1144,7 @@ def test_claude_protocol_check_forces_json_accept_header(monkeypatch, tmp_path):
     client.post(
         "/admin/claude/config",
         json={
-            "active_profile": "uocode",
+            "active_profile": "example-provider",
             "api_style": "auto",
             "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
         },
@@ -1144,7 +1153,7 @@ def test_claude_protocol_check_forces_json_accept_header(monkeypatch, tmp_path):
     response = client.post("/admin/claude/protocol/check", json={"model": "claude-opus-4.6"}, headers={"accept": "*/*"})
 
     assert response.status_code == 200
-    assert captured["url"] == "https://www.uocode.com/v1/messages"
+    assert captured["url"] == "https://example.com/v1/messages"
     assert captured["headers"]["Accept"] == "application/json"
 
 
@@ -1180,11 +1189,11 @@ def test_update_codex_config_changes_active_profile_and_api_style(monkeypatch, t
 
     client = TestClient(create_app())
     client.post(
-        "/admin/profiles/uocode",
+        "/admin/profiles/example-provider",
         json={
-            "name": "UoCode",
-            "base_url": "https://www.uocode.com",
-            "api_key": "uocode-key",
+            "name": "Example Provider",
+            "base_url": "https://example.com",
+            "api_key": "example-key",
             "default_model": "gpt-5.5",
             "models": "gpt-5.5",
         },
@@ -1356,8 +1365,8 @@ def test_refresh_models_updates_active_profile(monkeypatch, tmp_path):
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
 
     async def fake_get(self, url, headers):
-        assert url == "https://www.uocode.com/v1/models"
-        assert headers["Authorization"] == "Bearer uocode-key"
+        assert url == "https://example.com/v1/models"
+        assert headers["Authorization"] == "Bearer example-key"
         return httpx.Response(
             200,
             json={
@@ -1374,11 +1383,11 @@ def test_refresh_models_updates_active_profile(monkeypatch, tmp_path):
 
     client = TestClient(create_app())
     client.post(
-        "/admin/profiles/uocode",
+        "/admin/profiles/example-provider",
         json={
-            "name": "UoCode",
-            "base_url": "https://www.uocode.com",
-            "api_key": "uocode-key",
+            "name": "Example Provider",
+            "base_url": "https://example.com",
+            "api_key": "example-key",
             "default_model": "model-a",
             "models": "old-model",
         },
@@ -1402,11 +1411,11 @@ def test_refresh_models_failure_keeps_existing_models(monkeypatch, tmp_path):
 
     client = TestClient(create_app())
     client.post(
-        "/admin/profiles/uocode",
+        "/admin/profiles/example-provider",
         json={
-            "name": "UoCode",
-            "base_url": "https://www.uocode.com",
-            "api_key": "uocode-key",
+            "name": "Example Provider",
+            "base_url": "https://example.com",
+            "api_key": "example-key",
             "default_model": "old-model",
             "models": "old-model",
         },
@@ -1822,18 +1831,18 @@ def test_protocol_check_reports_codex_and_upstream_contract(monkeypatch, tmp_pat
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
 
     async def fake_get(self, url, headers):
-        assert url == "https://www.uocode.com/v1/models"
+        assert url == "https://example.com/v1/models"
         return httpx.Response(200, json={"data": [{"id": "model-a"}]})
 
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
 
     client = TestClient(create_app())
     client.post(
-        "/admin/profiles/uocode",
+        "/admin/profiles/example-provider",
         json={
-            "name": "UoCode",
-            "base_url": "https://www.uocode.com",
-            "api_key": "uocode-key",
+            "name": "Example Provider",
+            "base_url": "https://example.com",
+            "api_key": "example-key",
             "default_model": "model-a",
             "models": "model-a",
         },
@@ -1846,7 +1855,7 @@ def test_protocol_check_reports_codex_and_upstream_contract(monkeypatch, tmp_pat
     assert body["ok"] is True
     assert body["codex_desktop"]["base_url"] == "http://127.0.0.1:8383/v1"
     assert body["upstream"]["models_ok"] is True
-    assert body["upstream"]["models_url"] == "https://www.uocode.com/v1/models"
+    assert body["upstream"]["models_url"] == "https://example.com/v1/models"
     assert "configured_api_style" not in body["upstream"]
     assert "resolved_api_style" not in body["upstream"]
     assert "responses_url" not in body["upstream"]
