@@ -7,7 +7,7 @@ AIProxy 是给 Codex Desktop 和 Claude Desktop 使用的本地中转代理。
 ## 功能
 
 - 支持配置任意 OpenAI-compatible 中转平台。
-- 默认示例支持 `gpt-5.5` 和 `gpt-5.4`。
+- 默认示例使用“字节跳动”平台和 `glm-5.1` 模型。
 - 支持非流式 `/v1/responses`。
 - 支持流式 `/v1/responses`，尾部会补齐 `response.completed` 和 `[DONE]`。
 - 支持在 Codex 和 Claude 页面分别配置各自的上游协议。
@@ -18,16 +18,9 @@ AIProxy 是给 Codex Desktop 和 Claude Desktop 使用的本地中转代理。
 
 ## 环境
 
-运行环境使用你的 conda 环境：
+在你自己的 Python 环境中安装依赖：
 
 ```bash
-conda activate iai
-```
-
-如果环境里缺依赖：
-
-```bash
-cd /Users/liangrn/Documents/Codes/AIProxy
 pip install -r requirements.txt
 ```
 
@@ -36,7 +29,6 @@ pip install -r requirements.txt
 创建本地环境配置：
 
 ```bash
-cd /Users/liangrn/Documents/Codes/AIProxy
 cp .env.example .env
 ```
 
@@ -69,13 +61,13 @@ UPSTREAM_MODELS=模型A,模型B,模型C
 管理页里的“平台地址”可以只填根地址，例如：
 
 ```text
-https://www.uocode.com
+https://ark.cn-beijing.volces.com/api/coding
 ```
 
 程序会自动按 OpenAI-compatible API 约定补成：
 
 ```text
-https://www.uocode.com/v1
+https://ark.cn-beijing.volces.com/api/coding/v1
 ```
 
 如果平台走 `chat` 协议，要求上游兼容 OpenAI Chat Completions streaming，也就是支持：
@@ -95,7 +87,7 @@ http://127.0.0.1:8383/
 
 如果要自定义运行时配置文件路径，可以设置 `AIPROXY_CONFIG_PATH`。旧的 `CODEXPROXY_CONFIG_PATH` 仍然兼容，但新配置建议使用 `AIPROXY_CONFIG_PATH`。
 
-管理页支持多个共享中转配置，例如 UoCode、AiCoeGo 和字节跳动。Codex 和 Claude 会分别选择自己的当前配置，互不影响。
+管理页支持多个共享中转配置。Codex 和 Claude 共用同一组平台列表，但各自选择当前生效的平台，互不影响。
 
 Codex 页和 Claude 页会分别配置各自的“上游协议”：
 
@@ -106,10 +98,15 @@ Codex 页和 Claude 页会分别配置各自的“上游协议”：
 
 管理页的模型流程：
 
-- 填写平台名称、平台地址和 API Key。
-- 点击“刷新模型”，AIProxy 会请求当前平台的 `/v1/models`。
-- 刷新成功后，默认模型输入框会变成可输入过滤的模型选择框。
-- 选择默认模型并保存后，新请求会立即使用这个模型。
+- 先在“添加中转平台”里填写平台名称、平台地址和 API Key，并保存。
+- `CodexProxy` 页会在“选择中转平台”下方显示“默认模型”和“刷新模型”。
+- `CodexProxy` 点击“刷新模型”后，AIProxy 会请求当前平台的 `/v1/models`，并更新当前平台的模型候选列表。
+- `CodexProxy` 的“默认模型”下拉框会展示当前平台的完整模型列表；选择后会直接保存到当前平台配置，并立即生效。
+- `ClaudeProxy` 不单独维护默认模型；它只维护“模型映射”。
+- `ClaudeProxy` 的“模型映射”标题右侧提供“刷新模型”，点击后同样会请求当前平台的 `/v1/models`，并更新当前平台的模型候选列表。
+- `ClaudeProxy` 每条映射右侧的上游模型输入框支持直接手输，也支持展开后从当前平台的完整模型列表中选择。
+- `ClaudeProxy` 保存映射时，只会更新模型映射，不会覆盖当前平台的默认模型。
+- 如果 `Codex` 和 `Claude` 使用同一个中转平台，任一侧刷新模型后，另一侧看到的候选模型列表也会同步更新。
 
 管理页提供“验证配置”按钮，用来检查平台模型接口是否可用：
 
@@ -125,8 +122,6 @@ API Key 会直接显示在管理页中，方便本机维护配置。不要把管
 前台启动，适合调试：
 
 ```bash
-cd /Users/liangrn/Documents/Codes/AIProxy
-conda activate iai
 ./start.sh
 ```
 
@@ -139,27 +134,22 @@ http://127.0.0.1:8383
 后台启动，适合日常使用：
 
 ```bash
-cd /Users/liangrn/Documents/Codes/AIProxy
-conda activate iai
 nohup ./start.sh > aiproxy.log 2>&1 &
 ```
 
 关停服务：
 
 ```bash
-cd /Users/liangrn/Documents/Codes/AIProxy
 ./stop.sh
 ```
 
 重启服务：
 
 ```bash
-cd /Users/liangrn/Documents/Codes/AIProxy
-conda activate iai
 ./restart.sh
 ```
 
-如果只是修改中转平台、API Key 或默认模型，不需要重启，管理页保存后会立即生效。如果修改了 `.env` 里的 `LISTEN_HOST` 或 `LISTEN_PORT`，需要重启。
+如果只是修改中转平台、API Key、默认模型或 Claude 模型映射，不需要重启，管理页保存后会立即生效。如果修改了 `.env` 里的 `LISTEN_HOST` 或 `LISTEN_PORT`，需要重启。
 
 ## 验证代理
 
@@ -180,7 +170,7 @@ curl -sS http://127.0.0.1:8383/healthz
 ```bash
 curl -sS http://127.0.0.1:8383/v1/responses \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.5","input":"say hi","stream":false}'
+  -d '{"model":"glm-5.1","input":"say hi","stream":false}'
 ```
 
 流式验证：
@@ -188,7 +178,7 @@ curl -sS http://127.0.0.1:8383/v1/responses \
 ```bash
 curl -N http://127.0.0.1:8383/v1/responses \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.5","input":"count 1 to 3","stream":true}'
+  -d '{"model":"glm-5.1","input":"count 1 to 3","stream":true}'
 ```
 
 流式输出最后应该包含：
@@ -198,12 +188,12 @@ event: response.completed
 data: [DONE]
 ```
 
-验证 `gpt-5.4`：
+验证 `glm-4.7`：
 
 ```bash
 curl -N http://127.0.0.1:8383/v1/responses \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.4","input":"count 1 to 2","stream":true}'
+  -d '{"model":"glm-4.7","input":"count 1 to 2","stream":true}'
 ```
 
 ## 配置 Codex Desktop
@@ -222,21 +212,19 @@ curl -N http://127.0.0.1:8383/v1/responses \
 切换 Codex Desktop 到本地代理：
 
 ```bash
-cd /Users/liangrn/Documents/Codes/AIProxy
-conda activate iai
-python scripts/codex_config.py install --model gpt-5.5 --proxy-url http://127.0.0.1:8383
+python scripts/codex_config.py install --model glm-5.1 --proxy-url http://127.0.0.1:8383
 ```
 
-如果要切换到 `gpt-5.4`：
+如果要切换到其他模型，例如 `glm-4.7`：
 
 ```bash
-python scripts/codex_config.py install --model gpt-5.4 --proxy-url http://127.0.0.1:8383
+python scripts/codex_config.py install --model glm-4.7 --proxy-url http://127.0.0.1:8383
 ```
 
 如果要启用“保留官方登录态代理”：
 
 ```bash
-python scripts/codex_config.py install --mode auth-proxy --model gpt-5.4 --proxy-url http://127.0.0.1:8383
+python scripts/codex_config.py install --mode auth-proxy --model glm-5.1 --proxy-url http://127.0.0.1:8383
 ```
 
 旧的 `openai-compatible` 覆盖内置 `openai` provider 方案不可用。Codex Desktop 会拒绝覆盖内置 `openai` provider，错误形式是 `model_providers contains reserved built-in provider IDs: openai`。
@@ -251,7 +239,7 @@ python scripts/codex_config.py status
 
 ```toml
 model_provider = "codex_proxy"
-model = "gpt-5.5"
+model = "glm-5.1"
 
 [model_providers.codex_proxy]
 name = "AI Proxy"
@@ -281,7 +269,7 @@ Model: claude-opus-4.6
 
 ClaudeProxy 不会修改 Claude Desktop 的本地配置文件；它只在管理页里显示应填写的 Gateway URL，并提供连通性验证。
 
-Claude 和 Codex 共享中转平台列表，但当前生效平台互相独立。可以让 Codex 使用 UoCode，同时让 Claude 使用“字节跳动”。
+Claude 和 Codex 共享中转平台列表，但当前生效平台互相独立。可以让 Codex 和 Claude 使用不同平台，也可以共用同一个“字节跳动”配置。
 
 管理页的 ClaudeProxy Tab 支持配置模型映射，例如：
 
@@ -290,6 +278,13 @@ claude-opus-4.6   -> glm-5.1
 claude-sonnet-4.6 -> glm-5.1
 claude-haiku-4.6  -> glm-5.1
 ```
+
+ClaudeProxy 页面的映射交互规则：
+
+- 左侧 `claude-opus-4.6` 这列是 Claude 请求模型名，保持手工输入。
+- 右侧 `glm-5.1` 这列是上游真实模型名，支持直接输入，也支持从刷新后的模型列表中下拉选择。
+- 点击“刷新模型”只会更新右侧候选列表，不会自动改写已经填写的映射值。
+- 如果某个已填的上游模型不在新拉取的候选列表中，原值会保留，仍然可以继续保存。
 
 请求进入本地代理后，只会把 Anthropic Messages 请求体中的 `model` 改写为映射后的真实模型，其他字段尽量原样透传到上游 `{平台地址}/messages`。上游响应里的 `model` 会在非流式响应中改回 Claude Desktop 请求的模型名。
 
@@ -300,8 +295,6 @@ ClaudeProxy v1 默认使用 Anthropic Messages 透传模式，已经适合支持
 恢复到第一次安装 AIProxy 前的原始配置：
 
 ```bash
-cd /Users/liangrn/Documents/Codes/AIProxy
-conda activate iai
 python scripts/codex_config.py restore
 ```
 
@@ -320,8 +313,6 @@ config.toml.codexproxy-original-backup
 ## 测试
 
 ```bash
-cd /Users/liangrn/Documents/Codes/AIProxy
-conda activate iai
 pytest -q
 ```
 
