@@ -186,14 +186,23 @@ async def create_claude_message_with_metadata(request: Request, payload: dict[st
                 try:
                     body = response.json()
                 except ValueError as exc:
-                    raise HTTPException(status_code=502, detail=f"Upstream returned non-JSON response: POST {url}") from exc
+                    if settings.upstream_api_style == "anthropic":
+                        raise HTTPException(status_code=502, detail=f"Upstream returned non-JSON response: POST {url}") from exc
+                    fallback_reason = "v1/messages did not return Anthropic JSON"
+                    body = None
+                if body is None:
+                    pass
                 if not isinstance(body, dict):
-                    raise HTTPException(status_code=502, detail=f"Upstream returned unexpected JSON type for POST {url}")
-                body["model"] = claude_model
-                return body, "anthropic", url, None
+                    if settings.upstream_api_style == "anthropic":
+                        raise HTTPException(status_code=502, detail=f"Upstream returned unexpected JSON type for POST {url}")
+                    fallback_reason = "v1/messages did not return Anthropic JSON"
+                else:
+                    body["model"] = claude_model
+                    return body, "anthropic", url, None
             if settings.upstream_api_style == "anthropic" or not is_unsupported_claude_messages_endpoint(response):
                 raise HTTPException(status_code=response.status_code, detail=response.text)
-            fallback_reason = "v1/messages is not supported by the upstream provider"
+            if fallback_reason is None:
+                fallback_reason = "v1/messages is not supported by the upstream provider"
 
         chat_payload = anthropic_messages_to_chat_payload(payload, upstream_model, stream=False)
         url = f"{settings.upstream_base_url}/chat/completions"
@@ -1027,7 +1036,7 @@ ADMIN_HTML = """
 
     function setUiBusy(isBusy) {
       uiBusy = isBusy;
-      ['profileSelect', 'codexApiStyle', 'claudeProfileSelect', 'claudeApiStyle', 'codexDefaultModel', 'codexRefreshModels', 'claudeRefreshModels', 'saveClaudeConfig', 'addMapping'].forEach((id) => {
+      ['profileSelect', 'codexApiStyle', 'claudeProfileSelect', 'claudeApiStyle', 'codexDefaultModel', 'codexRefreshModels', 'claudeRefreshModels', 'saveClaudeConfig', 'addMapping', 'checkClaudeProtocol', 'checkClaudeModel'].forEach((id) => {
         const element = $(id);
         if (element) {
           element.disabled = isBusy;

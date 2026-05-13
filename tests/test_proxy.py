@@ -653,6 +653,64 @@ def test_claude_auto_protocol_falls_back_to_chat_when_messages_unsupported(monke
     assert response.json()["content"] == [{"type": "text", "text": "fallback ok"}]
 
 
+def test_claude_auto_protocol_falls_back_to_chat_when_messages_returns_non_json(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    calls = []
+
+    async def fake_post(self, url, headers, json):
+        calls.append(url)
+        if url.endswith("/messages"):
+            return httpx.Response(200, text="<html>ok</html>", headers={"content-type": "text/html"})
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat_1",
+                "model": "glm-5.1",
+                "choices": [{"message": {"role": "assistant", "content": "fallback ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/uocode",
+        json={
+            "name": "UoCode",
+            "base_url": "https://www.uocode.com/v1",
+            "api_key": "uocode-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "uocode",
+            "api_style": "auto",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post(
+        "/anthropic/v1/messages",
+        json={
+            "model": "claude-opus-4.6",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        "https://www.uocode.com/v1/messages",
+        "https://www.uocode.com/v1/chat/completions",
+    ]
+    assert response.json()["content"] == [{"type": "text", "text": "fallback ok"}]
+
+
 def test_claude_auto_stream_falls_back_to_chat_when_messages_unsupported(monkeypatch, tmp_path):
     config_path = tmp_path / "config.local.json"
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
@@ -922,6 +980,61 @@ def test_claude_protocol_check_reports_auto_fallback_to_chat(monkeypatch, tmp_pa
     assert body["upstream"]["resolved_api_style"] == "chat"
     assert body["upstream"]["messages_url"] == "https://api.aigocode.com/v1/chat/completions"
     assert body["upstream"]["fallback_reason"] == "v1/messages is not supported by the upstream provider"
+
+
+def test_claude_protocol_check_reports_auto_fallback_for_non_json_messages(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    calls = []
+
+    async def fake_post(self, url, headers, json):
+        calls.append(url)
+        if url.endswith("/messages"):
+            return httpx.Response(200, text="<html>ok</html>", headers={"content-type": "text/html"})
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat_1",
+                "model": "glm-5.1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/uocode",
+        json={
+            "name": "UoCode",
+            "base_url": "https://www.uocode.com/v1",
+            "api_key": "uocode-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "uocode",
+            "api_style": "auto",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post("/admin/claude/protocol/check", json={"model": "claude-opus-4.6"})
+
+    assert response.status_code == 200
+    assert calls == [
+        "https://www.uocode.com/v1/messages",
+        "https://www.uocode.com/v1/chat/completions",
+    ]
+    body = response.json()
+    assert body["ok"] is True
+    assert body["upstream"]["resolved_api_style"] == "chat"
+    assert body["upstream"]["messages_url"] == "https://www.uocode.com/v1/chat/completions"
+    assert body["upstream"]["fallback_reason"] == "v1/messages did not return Anthropic JSON"
 
 
 def test_admin_config_exposes_api_style(monkeypatch, tmp_path):
