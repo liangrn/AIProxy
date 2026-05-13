@@ -43,11 +43,11 @@ cp .env.example .env
 编辑 `.env`：
 
 ```bash
-UPSTREAM_BASE_URL=https://www.uocode.com/v1
-UPSTREAM_PROVIDER_NAME=uocode
+UPSTREAM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding
+UPSTREAM_PROVIDER_NAME=字节跳动
 UPSTREAM_API_KEY=你的平台-key
-UPSTREAM_MODEL=gpt-5.5
-UPSTREAM_MODELS=gpt-5.5,gpt-5.4,gpt-5.4-mini,gpt-5.3-codex
+UPSTREAM_MODEL=glm-5.1
+UPSTREAM_MODELS=glm-5.1,glm-4.7
 UPSTREAM_USER_AGENT=curl/8.7.1
 LISTEN_HOST=127.0.0.1
 LISTEN_PORT=8383
