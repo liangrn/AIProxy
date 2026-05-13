@@ -2,7 +2,7 @@ import json
 import time
 from typing import Any
 
-from .adapters import make_message_id, make_response_id
+from .adapters import content_to_text, make_message_id, make_response_id, responses_usage
 
 
 def encode_sse(event: str, data: dict[str, Any] | str) -> str:
@@ -83,7 +83,7 @@ def response_finished(response_id: str, message_id: str, model: str, text: str, 
         "error": None,
         "model": model,
         "output": [message],
-        "usage": usage,
+        "usage": responses_usage(usage),
     }
     return [
         encode_sse(
@@ -152,8 +152,9 @@ async def chat_stream_to_responses_sse(chunks: Any, model: str):
         choices = chunk.get("choices") or []
         if choices:
             delta = choices[0].get("delta") or {}
-            content = delta.get("content")
+            content = delta.get("content") or delta.get("reasoning_content")
             if content:
+                content = content_to_text(content)
                 text_parts.append(content)
                 yield text_delta(message_id, content, sequence)
                 sequence += 1

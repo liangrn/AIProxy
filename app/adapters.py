@@ -55,6 +55,16 @@ def content_to_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
+def assistant_message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if content:
+        return content_to_text(content)
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content:
+        return content_to_text(reasoning_content)
+    return ""
+
+
 def responses_to_chat_payload(payload: dict[str, Any], default_model: str, stream: bool) -> dict[str, Any]:
     chat_payload: dict[str, Any] = {
         "model": payload.get("model") or default_model,
@@ -84,13 +94,32 @@ def responses_to_chat_payload(payload: dict[str, Any], default_model: str, strea
     if instructions:
         chat_payload["messages"] = [{"role": "system", "content": str(instructions)}] + chat_payload["messages"]
 
+    if stream:
+        stream_options = dict(payload.get("stream_options") or {})
+        stream_options.setdefault("include_usage", True)
+        chat_payload["stream_options"] = stream_options
+
     return chat_payload
+
+
+def responses_usage(usage: Any) -> dict[str, int]:
+    if not isinstance(usage, dict):
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+    input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+    output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+    total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
 
 
 def chat_completion_to_response(chat: dict[str, Any], model: str) -> dict[str, Any]:
     choice = (chat.get("choices") or [{}])[0]
     message = choice.get("message") or {}
-    text = message.get("content") or ""
+    text = assistant_message_text(message)
     created = int(time.time())
 
     return {
@@ -117,5 +146,5 @@ def chat_completion_to_response(chat: dict[str, Any], model: str) -> dict[str, A
                 ],
             }
         ],
-        "usage": chat.get("usage"),
+        "usage": responses_usage(chat.get("usage")),
     }

@@ -4,11 +4,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import app.main as app_main
 from app.main import create_app
-from app.config import get_settings
+from app.config import get_settings, resolve_claude_model, runtime_config_path
 
 
-def test_non_stream_response_uses_chat_completion(monkeypatch):
+def test_non_stream_response_uses_chat_completion(monkeypatch, tmp_path):
     captured = {}
 
     async def fake_create_chat_completion(payload, stream):
@@ -29,6 +30,8 @@ def test_non_stream_response_uses_chat_completion(monkeypatch):
     monkeypatch.setenv("UPSTREAM_API_KEY", "test-key")
     monkeypatch.setenv("UPSTREAM_BASE_URL", "https://example.test/v1")
     monkeypatch.setenv("UPSTREAM_MODEL", "gpt-5.5")
+    monkeypatch.setenv("UPSTREAM_API_STYLE", "chat")
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
     monkeypatch.setattr("app.main.create_chat_completion", fake_create_chat_completion)
 
     client = TestClient(create_app())
@@ -45,7 +48,77 @@ def test_non_stream_response_uses_chat_completion(monkeypatch):
     assert captured["payload"]["messages"] == [{"role": "user", "content": "say hi"}]
 
 
-def test_stream_response_finishes_with_response_completed(monkeypatch):
+def test_non_stream_response_passes_through_upstream_responses_when_configured(monkeypatch, tmp_path):
+    async def fake_create_upstream_response(payload):
+        assert payload["input"] == "say hi"
+        return {
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.5",
+            "output": [{"id": "msg_1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "Hi!"}]}],
+            "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+        }
+
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
+    monkeypatch.setattr("app.main.create_upstream_response", fake_create_upstream_response)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/responses-provider",
+        json={
+            "name": "Responses Provider",
+            "base_url": "https://responses.example",
+            "api_key": "test-key",
+            "default_model": "gpt-5.5",
+            "models": "gpt-5.5",
+            "api_style": "responses",
+        },
+    )
+
+    response = client.post("/v1/responses", json={"input": "say hi", "stream": False})
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_upstream"
+    assert response.json()["output"][0]["content"][0]["text"] == "Hi!"
+
+
+def test_auto_api_style_falls_back_to_chat_when_responses_is_unsupported(monkeypatch, tmp_path):
+    async def fake_create_upstream_response(payload):
+        raise app_main.UpstreamProtocolUnsupported("responses unsupported")
+
+    async def fake_create_chat_completion(payload, stream):
+        return {
+            "id": "chat_1",
+            "model": "gpt-5.5",
+            "choices": [{"message": {"role": "assistant", "content": "Fallback ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
+    monkeypatch.setattr("app.main.create_chat_completion", fake_create_chat_completion)
+    monkeypatch.setattr("app.main.create_upstream_response", fake_create_upstream_response)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/auto-provider",
+        json={
+            "name": "Auto Provider",
+            "base_url": "https://auto.example",
+            "api_key": "test-key",
+            "default_model": "gpt-5.5",
+            "models": "gpt-5.5",
+            "api_style": "auto",
+        },
+    )
+
+    response = client.post("/v1/responses", json={"input": "say hi", "stream": False})
+
+    assert response.status_code == 200
+    assert response.json()["output"][0]["content"][0]["text"] == "Fallback ok"
+
+
+def test_stream_response_finishes_with_response_completed(monkeypatch, tmp_path):
     async def fake_stream_chat_completion(payload):
         yield {"choices": [{"delta": {"content": "Hel"}, "finish_reason": None}]}
         yield {"choices": [{"delta": {"content": "lo"}, "finish_reason": None}]}
@@ -54,6 +127,8 @@ def test_stream_response_finishes_with_response_completed(monkeypatch):
 
     monkeypatch.setenv("UPSTREAM_API_KEY", "test-key")
     monkeypatch.setenv("UPSTREAM_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("UPSTREAM_API_STYLE", "chat")
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
     monkeypatch.setattr("app.main.stream_chat_completion", fake_stream_chat_completion)
 
     client = TestClient(create_app())
@@ -66,10 +141,80 @@ def test_stream_response_finishes_with_response_completed(monkeypatch):
     assert '"delta":"Hel"' in text
     assert '"delta":"lo"' in text
     assert "event: response.completed" in text
+    assert '"input_tokens":0' in text
+    assert '"output_tokens":0' in text
+    assert '"total_tokens":3' in text
     assert text.rstrip().endswith("data: [DONE]")
 
 
-def test_input_items_are_converted_to_chat_messages(monkeypatch):
+def test_non_stream_response_translates_chat_usage_to_responses_usage(monkeypatch, tmp_path):
+    async def fake_create_chat_completion(payload, stream):
+        return {
+            "id": "chat_1",
+            "model": "gpt-5.5",
+            "choices": [{"message": {"role": "assistant", "content": "Hi!"}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9},
+        }
+
+    monkeypatch.setenv("UPSTREAM_API_KEY", "test-key")
+    monkeypatch.setenv("UPSTREAM_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("UPSTREAM_API_STYLE", "chat")
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
+    monkeypatch.setattr("app.main.create_chat_completion", fake_create_chat_completion)
+
+    client = TestClient(create_app())
+    response = client.post("/v1/responses", json={"input": "say hi", "stream": False})
+
+    assert response.status_code == 200
+    assert response.json()["usage"] == {"input_tokens": 4, "output_tokens": 5, "total_tokens": 9}
+
+
+def test_non_stream_response_uses_reasoning_content_when_content_is_empty(monkeypatch, tmp_path):
+    async def fake_create_chat_completion(payload, stream):
+        return {
+            "id": "chat_1",
+            "model": "glm-5.1",
+            "choices": [{"message": {"role": "assistant", "content": "", "reasoning_content": "OK"}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9},
+        }
+
+    monkeypatch.setenv("UPSTREAM_API_KEY", "test-key")
+    monkeypatch.setenv("UPSTREAM_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("UPSTREAM_API_STYLE", "chat")
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
+    monkeypatch.setattr("app.main.create_chat_completion", fake_create_chat_completion)
+
+    client = TestClient(create_app())
+    response = client.post("/v1/responses", json={"model": "glm-5.1", "input": "say ok", "stream": False})
+
+    assert response.status_code == 200
+    assert response.json()["output"][0]["content"][0]["text"] == "OK"
+
+
+def test_stream_response_uses_reasoning_content_delta(monkeypatch, tmp_path):
+    async def fake_stream_chat_completion(payload):
+        yield {"choices": [{"delta": {"reasoning_content": "O"}, "finish_reason": None}]}
+        yield {"choices": [{"delta": {"reasoning_content": "K"}, "finish_reason": None}]}
+        yield {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"total_tokens": 2}}
+        yield "[DONE]"
+
+    monkeypatch.setenv("UPSTREAM_API_KEY", "test-key")
+    monkeypatch.setenv("UPSTREAM_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("UPSTREAM_API_STYLE", "chat")
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
+    monkeypatch.setattr("app.main.stream_chat_completion", fake_stream_chat_completion)
+
+    client = TestClient(create_app())
+    with client.stream("POST", "/v1/responses", json={"model": "glm-5.1", "input": "say ok", "stream": True}) as response:
+        assert response.status_code == 200
+        text = "".join(response.iter_text())
+
+    assert '"delta":"O"' in text
+    assert '"delta":"K"' in text
+    assert '"text":"OK"' in text
+
+
+def test_input_items_are_converted_to_chat_messages(monkeypatch, tmp_path):
     captured = {}
 
     async def fake_create_chat_completion(payload, stream):
@@ -78,6 +223,8 @@ def test_input_items_are_converted_to_chat_messages(monkeypatch):
 
     monkeypatch.setenv("UPSTREAM_API_KEY", "test-key")
     monkeypatch.setenv("UPSTREAM_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("UPSTREAM_API_STYLE", "chat")
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
     monkeypatch.setattr("app.main.create_chat_completion", fake_create_chat_completion)
 
     client = TestClient(create_app())
@@ -171,6 +318,23 @@ def test_admin_config_persists_and_models_use_it(monkeypatch, tmp_path):
     }
 
 
+def test_aiproxy_config_path_takes_precedence_over_legacy_env(monkeypatch, tmp_path):
+    legacy_path = tmp_path / "legacy.json"
+    aiproxy_path = tmp_path / "aiproxy.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(legacy_path))
+    monkeypatch.setenv("AIPROXY_CONFIG_PATH", str(aiproxy_path))
+
+    assert runtime_config_path() == aiproxy_path
+
+
+def test_legacy_codexproxy_config_path_still_works(monkeypatch, tmp_path):
+    legacy_path = tmp_path / "legacy.json"
+    monkeypatch.delenv("AIPROXY_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(legacy_path))
+
+    assert runtime_config_path() == legacy_path
+
+
 def test_admin_config_keeps_existing_api_key_when_blank(monkeypatch, tmp_path):
     config_path = tmp_path / "config.local.json"
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
@@ -246,12 +410,219 @@ def test_admin_profiles_switch_active_profile_and_normalize_base_url(monkeypatch
     assert settings.upstream_base_url == "https://aicoego.example/v1"
     assert settings.upstream_api_key == "aicoego-key"
     assert settings.upstream_model == "aicoego-default"
+    assert settings.upstream_api_style == "chat"
 
     response = client.get("/v1/models")
     assert response.json()["data"] == [
         {"id": "aicoego-default", "object": "model", "owned_by": "AiCoeGo"},
         {"id": "aicoego-long", "object": "model", "owned_by": "AiCoeGo"},
     ]
+
+
+def test_claude_active_profile_is_independent_from_codex(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/codex-provider",
+        json={
+            "name": "Codex Provider",
+            "base_url": "https://codex.example",
+            "api_key": "codex-key",
+            "default_model": "codex-model",
+            "models": "codex-model",
+        },
+    )
+    client.post(
+        "/admin/profiles/claude-provider",
+        json={
+            "name": "Claude Provider",
+            "base_url": "https://claude.example",
+            "api_key": "claude-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+
+    response = client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "claude-provider",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    assert response.status_code == 200
+    config = client.get("/admin/config").json()["config"]
+    assert config["active_profile"] == "claude-provider"
+    assert config["codex"]["active_profile"] == "claude-provider"
+    assert config["claude"]["active_profile"] == "claude-provider"
+
+    client.post("/admin/profiles/codex-provider/activate")
+    config = client.get("/admin/config").json()["config"]
+    assert config["codex"]["active_profile"] == "codex-provider"
+    assert config["claude"]["active_profile"] == "claude-provider"
+
+
+def test_claude_messages_maps_model_and_rewrites_response_model(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    captured = {}
+
+    async def fake_post(self, url, headers, json):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["payload"] = json
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "glm-5.1",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/byte",
+        json={
+            "name": "字节跳动",
+            "base_url": "https://ark.cn-beijing.volces.com/api/coding/v1",
+            "api_key": "byte-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "byte",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post(
+        "/anthropic/v1/messages",
+        headers={"anthropic-version": "2023-06-01", "anthropic-beta": "test-beta", "x-api-key": "local-key"},
+        json={
+            "model": "claude-opus-4.6",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["url"] == "https://ark.cn-beijing.volces.com/api/coding/v1/messages"
+    assert captured["payload"]["model"] == "glm-5.1"
+    assert captured["payload"]["messages"] == [{"role": "user", "content": "ping"}]
+    assert captured["headers"]["Authorization"] == "Bearer byte-key"
+    assert captured["headers"]["anthropic-version"] == "2023-06-01"
+    assert captured["headers"]["anthropic-beta"] == "test-beta"
+    assert "x-api-key" not in captured["headers"]
+    assert response.json()["model"] == "claude-opus-4.6"
+
+
+def test_claude_models_expose_mapped_claude_names(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/byte",
+        json={
+            "name": "字节跳动",
+            "base_url": "https://ark.cn-beijing.volces.com/api/coding/v1",
+            "api_key": "byte-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "byte",
+            "model_mappings": [
+                {"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"},
+                {"claude_model": "claude-sonnet-*", "upstream_model": "glm-5.1"},
+            ],
+        },
+    )
+
+    response = client.get("/anthropic/v1/models")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == [
+        {"id": "claude-opus-4.6", "type": "model", "display_name": "claude-opus-4.6"},
+        {"id": "claude-sonnet-*", "type": "model", "display_name": "claude-sonnet-*"},
+    ]
+
+
+def test_claude_messages_rejects_unmapped_model(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/byte",
+        json={
+            "name": "字节跳动",
+            "base_url": "https://ark.cn-beijing.volces.com/api/coding/v1",
+            "api_key": "byte-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "byte",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post(
+        "/anthropic/v1/messages",
+        json={"model": "claude-unmapped-1", "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]},
+    )
+
+    assert response.status_code == 400
+    assert "Claude model mapping is not configured" in response.json()["detail"]
+
+
+def test_claude_model_exact_mapping_takes_precedence_over_wildcard():
+    mappings = [
+        {"claude_model": "claude-opus-*", "upstream_model": "fallback-model"},
+        {"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"},
+    ]
+
+    assert resolve_claude_model("claude-opus-4.6", mappings) == "glm-5.1"
+    assert resolve_claude_model("claude-opus-4.7", mappings) == "fallback-model"
+
+
+def test_admin_config_exposes_api_style(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/responses-provider",
+        json={
+            "name": "Responses Provider",
+            "base_url": "https://responses.example",
+            "api_key": "test-key",
+            "default_model": "gpt-5.5",
+            "models": "gpt-5.5",
+            "api_style": "responses",
+        },
+    )
+
+    response = client.get("/admin/config")
+
+    assert response.status_code == 200
+    assert response.json()["config"]["active"]["api_style"] == "responses"
 
 
 def test_refresh_models_updates_active_profile(monkeypatch, tmp_path):
@@ -321,15 +692,156 @@ def test_refresh_models_failure_keeps_existing_models(monkeypatch, tmp_path):
     assert get_settings().upstream_models == ["old-model"]
 
 
-def test_admin_page_uses_searchable_model_picker():
+def test_refresh_models_reports_compact_upstream_html_error(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    async def fake_get(self, url, headers):
+        return httpx.Response(
+            404,
+            text="<!DOCTYPE html><html><head><title>404</title></head><body>not found</body></html>",
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/aigocode",
+        json={
+            "name": "AIGoCode",
+            "base_url": "https://api.aigocode.com",
+            "api_key": "aigocode-key",
+            "default_model": "gpt-5.5",
+            "models": "gpt-5.5",
+        },
+    )
+
+    response = client.post("/admin/models/refresh")
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == (
+        "Upstream request failed: GET https://api.aigocode.com/v1/models -> 404 Not Found (text/html). HTML page returned"
+    )
+    assert get_settings().upstream_models == ["gpt-5.5"]
+
+
+def test_draft_refresh_models_does_not_change_active_profiles(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    async def fake_get(self, url, headers):
+        assert url == "https://draft.example/v1/models"
+        assert headers["Authorization"] == "Bearer draft-key"
+        return httpx.Response(200, json={"data": [{"id": "draft-model"}]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/codex",
+        json={
+            "name": "Codex",
+            "base_url": "https://codex.example",
+            "api_key": "codex-key",
+            "default_model": "codex-model",
+            "models": "codex-model",
+        },
+    )
+    client.post(
+        "/admin/profiles/claude",
+        json={
+            "name": "Claude",
+            "base_url": "https://claude.example",
+            "api_key": "claude-key",
+            "default_model": "claude-model",
+            "models": "claude-model",
+        },
+    )
+    client.post("/admin/claude/config", json={"active_profile": "claude"})
+
+    response = client.post(
+        "/admin/profiles/draft/models/refresh",
+        json={
+            "name": "Draft",
+            "base_url": "https://draft.example",
+            "api_key": "draft-key",
+            "default_model": "draft-model",
+            "models": "draft-model",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["models"] == ["draft-model"]
+    config = client.get("/admin/config").json()["config"]
+    assert config["codex"]["active_profile"] == "claude"
+    assert config["claude"]["active_profile"] == "claude"
+
+
+def test_draft_protocol_check_does_not_change_active_profiles(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    async def fake_get(self, url, headers):
+        assert url == "https://draft.example/v1/models"
+        return httpx.Response(200, json={"data": [{"id": "draft-model"}]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/codex",
+        json={
+            "name": "Codex",
+            "base_url": "https://codex.example",
+            "api_key": "codex-key",
+            "default_model": "codex-model",
+            "models": "codex-model",
+        },
+    )
+
+    response = client.post(
+        "/admin/profiles/draft/protocol/check",
+        json={
+            "name": "Draft",
+            "base_url": "https://draft.example",
+            "api_key": "draft-key",
+            "default_model": "draft-model",
+            "models": "draft-model",
+            "api_style": "chat",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["upstream"]["models_count"] == 1
+    assert client.get("/admin/config").json()["config"]["codex"]["active_profile"] == "codex"
+
+
+def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     client = TestClient(create_app())
 
     response = client.get("/")
 
     assert response.status_code == 200
     text = response.text
+    assert "AI Proxy管理" in text
+    assert "CodexProxy 管理" not in text
+    assert "添加中转平台" in text
+    assert "修改当前平台" in text
+    assert "profileDialog" in text
     assert 'id="modelMenu"' in text
     assert 'renderModelMenu' in text
+    assert 'showAllModels' in text
+    assert 'setRefreshLoading' in text
+    assert '正在刷新模型' in text
+    assert "保存并生效" in text
+    assert "保存配置" in text
+    assert "修改Codex配置" in text
+    assert "验证中..." in text
+    assert "保存中..." in text
+    assert "修改中..." in text
+    assert "恢复中..." in text
     assert 'datalist' not in text
 
 
@@ -352,6 +864,7 @@ def test_protocol_check_reports_codex_and_upstream_contract(monkeypatch, tmp_pat
             "api_key": "uocode-key",
             "default_model": "model-a",
             "models": "model-a",
+            "api_style": "chat",
         },
     )
 
@@ -364,3 +877,36 @@ def test_protocol_check_reports_codex_and_upstream_contract(monkeypatch, tmp_pat
     assert body["codex_desktop"]["base_url"] == "http://127.0.0.1:8383/v1"
     assert body["upstream"]["chat_completions_url"] == "https://www.uocode.com/v1/chat/completions"
     assert body["upstream"]["models_ok"] is True
+
+
+def test_protocol_check_reports_compact_upstream_html_error(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    async def fake_get(self, url, headers):
+        return httpx.Response(
+            404,
+            text="<!DOCTYPE html><html><body>not found</body></html>",
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/aigocode",
+        json={
+            "name": "AIGoCode",
+            "base_url": "https://api.aigocode.com",
+            "api_key": "aigocode-key",
+            "default_model": "gpt-5.5",
+            "models": "gpt-5.5",
+        },
+    )
+
+    response = client.post("/admin/protocol/check")
+
+    assert response.status_code == 502
+    assert response.json()["error"] == (
+        "Upstream request failed: GET https://api.aigocode.com/v1/models -> 404 Not Found (text/html). HTML page returned"
+    )

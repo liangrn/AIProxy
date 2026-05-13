@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 import argparse
-from datetime import datetime
 from pathlib import Path
 import re
 import shutil
 
 
 PROVIDER_NAME = "codex_proxy"
+OPENAI_PROVIDER_NAME = "openai"
+VALID_MODES = ("proxy", "auth-proxy", "openai-compatible")
 BEGIN = "# BEGIN CODEXPROXY MANAGED BLOCK"
 END = "# END CODEXPROXY MANAGED BLOCK"
+ORIGINAL_BACKUP_SUFFIX = ".codexproxy-original-backup"
 
 
 def strip_managed_block(text: str) -> str:
@@ -16,7 +18,15 @@ def strip_managed_block(text: str) -> str:
     return pattern.sub("\n", text).strip() + "\n"
 
 
-def replace_top_level_keys(text: str, model: str) -> str:
+def strip_provider_block(text: str, provider_name: str) -> str:
+    pattern = re.compile(
+        rf"\n?\[model_providers\.{re.escape(provider_name)}\]\n.*?(?=\n\[|$)",
+        re.DOTALL,
+    )
+    return pattern.sub("\n", text).strip() + "\n"
+
+
+def replace_top_level_keys(text: str, model: str, model_provider: str) -> str:
     lines = text.splitlines()
     result: list[str] = []
     in_top_level = True
@@ -28,7 +38,7 @@ def replace_top_level_keys(text: str, model: str) -> str:
         if stripped.startswith("["):
             if in_top_level:
                 if not seen_model_provider:
-                    result.append(f'model_provider = "{PROVIDER_NAME}"')
+                    result.append(f'model_provider = "{model_provider}"')
                     seen_model_provider = True
                 if not seen_model:
                     result.append(f'model = "{model}"')
@@ -36,7 +46,7 @@ def replace_top_level_keys(text: str, model: str) -> str:
             in_top_level = False
 
         if in_top_level and stripped.startswith("model_provider"):
-            result.append(f'model_provider = "{PROVIDER_NAME}"')
+            result.append(f'model_provider = "{model_provider}"')
             seen_model_provider = True
             continue
 
@@ -49,77 +59,100 @@ def replace_top_level_keys(text: str, model: str) -> str:
 
     if in_top_level:
         if not seen_model_provider:
-            result.append(f'model_provider = "{PROVIDER_NAME}"')
+            result.append(f'model_provider = "{model_provider}"')
         if not seen_model:
             result.append(f'model = "{model}"')
 
     return "\n".join(result).strip() + "\n"
 
 
-def managed_block(base_url: str) -> str:
+def managed_block(base_url: str, mode: str) -> str:
+    if mode == "openai-compatible":
+        raise ValueError("openai-compatible mode cannot override reserved built-in provider ID: openai")
+    provider_name = PROVIDER_NAME
+    display_name = "AI Proxy"
+    requires_openai_auth = "true" if mode == "auth-proxy" else "false"
     return f"""
 {BEGIN}
-[model_providers.{PROVIDER_NAME}]
-name = "Codex Proxy"
+[model_providers.{provider_name}]
+name = "{display_name}"
 base_url = "{base_url.rstrip("/")}/v1"
 wire_api = "responses"
-requires_openai_auth = false
+requires_openai_auth = {requires_openai_auth}
 stream_max_retries = 0
 {END}
 """.strip()
+def original_backup_path(config_path: Path) -> Path:
+    return config_path.with_name(f"{config_path.name}{ORIGINAL_BACKUP_SUFFIX}")
 
 
-def backup_config(config_path: Path) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = config_path.with_name(f"{config_path.name}.codexproxy-backup-{timestamp}")
-    shutil.copy2(config_path, backup_path)
+def backup_original_config(config_path: Path) -> Path:
+    backup_path = original_backup_path(config_path)
+    if not backup_path.exists():
+        shutil.copy2(config_path, backup_path)
     return backup_path
 
 
-def install(config_path: Path, model: str, proxy_url: str) -> Path:
+def install(config_path: Path, model: str, proxy_url: str, mode: str = "proxy") -> Path:
+    if mode == "openai-compatible":
+        raise ValueError("openai-compatible mode cannot override reserved built-in provider ID: openai")
+    if mode not in VALID_MODES:
+        raise ValueError(f"Unknown AIProxy Codex install mode: {mode}")
+
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text("", encoding="utf-8")
 
-    backup_path = backup_config(config_path)
-    text = strip_managed_block(config_path.read_text(encoding="utf-8"))
-    text = replace_top_level_keys(text, model)
-    text = text.rstrip() + "\n\n" + managed_block(proxy_url) + "\n"
+    existing_text = config_path.read_text(encoding="utf-8")
+    backup_path = backup_original_config(config_path)
+    text = strip_managed_block(existing_text)
+    model_provider = PROVIDER_NAME
+    text = strip_provider_block(text, model_provider)
+    text = replace_top_level_keys(text, model, model_provider)
+    text = text.rstrip() + "\n\n" + managed_block(proxy_url, mode) + "\n"
     config_path.write_text(text, encoding="utf-8")
     return backup_path
 
 
 def restore(config_path: Path) -> Path:
-    backups = sorted(config_path.parent.glob(f"{config_path.name}.codexproxy-backup-*"))
-    if not backups:
-        raise SystemExit(f"No CodexProxy backup found next to {config_path}")
-    latest = backups[-1]
-    shutil.copy2(latest, config_path)
-    return latest
+    original_backup = original_backup_path(config_path)
+    if original_backup.exists():
+        shutil.copy2(original_backup, config_path)
+        return original_backup
+    raise SystemExit(f"No AIProxy original backup found next to {config_path}")
 
 
 def status(config_path: Path) -> str:
     if not config_path.exists():
         return "missing"
     text = config_path.read_text(encoding="utf-8")
-    if BEGIN in text and f'model_provider = "{PROVIDER_NAME}"' in text:
-        return "installed"
+    if BEGIN not in text:
+        return "not-installed"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            break
+        if stripped.startswith("model_provider"):
+            if f'"{PROVIDER_NAME}"' in stripped or f'"{OPENAI_PROVIDER_NAME}"' in stripped:
+                return "installed"
+            return "not-installed"
     return "not-installed"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Install or restore Codex Desktop config for CodexProxy.")
+    parser = argparse.ArgumentParser(description="Install or restore Codex Desktop config for AIProxy.")
     parser.add_argument("command", choices=["install", "restore", "status"])
     parser.add_argument("--config", default=str(Path.home() / ".codex" / "config.toml"))
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--proxy-url", default="http://127.0.0.1:8383")
+    parser.add_argument("--mode", choices=VALID_MODES, default="proxy")
     args = parser.parse_args()
 
     config_path = Path(args.config).expanduser()
 
     if args.command == "install":
-        backup_path = install(config_path, args.model, args.proxy_url)
-        print(f"installed CodexProxy config: {config_path}")
+        backup_path = install(config_path, args.model, args.proxy_url, mode=args.mode)
+        print(f"installed AIProxy Codex config: {config_path}")
         print(f"backup: {backup_path}")
     elif args.command == "restore":
         backup_path = restore(config_path)

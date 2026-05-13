@@ -4,3 +4,4 @@ config.local.json
 __pycache__/
 *.py[cod]
 .DS_Store
+*.log

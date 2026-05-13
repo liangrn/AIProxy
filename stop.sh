@@ -14,9 +14,9 @@ fi
 
 pids="$(lsof -tiTCP:"$LISTEN_PORT" -sTCP:LISTEN 2>/dev/null || true)"
 if [[ -z "$pids" ]]; then
-  echo "CodexProxy is not running on ${LISTEN_HOST}:${LISTEN_PORT}"
+  echo "AIProxy is not running on ${LISTEN_HOST}:${LISTEN_PORT}"
   exit 0
 fi
 
 kill $pids
-echo "Stopped CodexProxy on ${LISTEN_HOST}:${LISTEN_PORT}"
+echo "Stopped AIProxy on ${LISTEN_HOST}:${LISTEN_PORT}"
