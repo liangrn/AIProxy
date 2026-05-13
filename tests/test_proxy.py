@@ -1037,6 +1037,66 @@ def test_claude_protocol_check_reports_auto_fallback_for_non_json_messages(monke
     assert body["upstream"]["fallback_reason"] == "v1/messages did not return Anthropic JSON"
 
 
+def test_claude_protocol_check_uses_submitted_model_mappings(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    captured = {}
+
+    async def fake_post(self, url, headers, json):
+        captured["url"] = url
+        captured["payload"] = json
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "glm-5.1",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/uocode",
+        json={
+            "name": "UoCode",
+            "base_url": "https://www.uocode.com/v1",
+            "api_key": "uocode-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "uocode",
+            "api_style": "anthropic",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "old-model"}],
+        },
+    )
+
+    response = client.post(
+        "/admin/claude/protocol/check",
+        json={
+            "model": "claude-opus-4.6",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["url"] == "https://www.uocode.com/v1/messages"
+    assert captured["payload"]["model"] == "glm-5.1"
+    body = response.json()
+    assert body["ok"] is True
+    assert body["upstream"]["model"] == "glm-5.1"
+
+
 def test_claude_protocol_check_forces_json_accept_header(monkeypatch, tmp_path):
     config_path = tmp_path / "config.local.json"
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
@@ -1518,6 +1578,7 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert 'id="claudeStatus"' in text
     assert '.status:empty' in text
     assert '.status-row' in text
+    assert '.status { font-size: 14px; color: #255e2e; white-space: pre-line; }' in text
     assert '.status-live { color: #9a3412; background: #fef3c7; border: 1px solid #fbbf24;' in text
     assert '.gateway-emphasis { color: #c2410c; }' in text
     assert 'query = input.value.trim().toLowerCase();' not in text
@@ -1551,12 +1612,18 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert '<button id="claudeRefreshModels" class="secondary compact-button" type="button">刷新模型</button>' in claude_panel
     assert 'id="checkClaudeProtocol"' not in claude_panel
     assert 'id="claudeProtocolStatus"' not in claude_panel
+    assert '验证模型名' not in claude_panel
+    assert 'id="claudeTestModel"' not in claude_panel
     assert "右侧模型可直接输入，也可从刷新后的候选列表中选择；保存时只影响模型映射。" in claude_panel
+    assert '<button id="checkClaudeModel" class="secondary" type="button">验证模型</button>' in claude_panel
     assert "ClaudeProxy 当前配置已生效。" in text
     assert "保存成功，ClaudeProxy 当前配置已生效。" in text
     assert "保存成功，ClaudeProxy 模型映射已生效。" not in text
     assert "v1/messages 不可用，已自动适配 v1/chat/completions" in text
     assert "v1/responses 不可用，已自动适配 v1/chat/completions" in text
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "lines.join('\\n')" in response.text
 
 
 def test_refresh_profile_models_updates_selected_namespace_profile(monkeypatch, tmp_path):

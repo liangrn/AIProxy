@@ -154,10 +154,10 @@ def claude_messages_headers(request: Request, stream: bool) -> dict[str, str]:
     return headers
 
 
-def mapped_claude_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
+def mapped_claude_payload(payload: dict[str, Any], model_mappings: list[dict[str, str]] | None = None) -> tuple[dict[str, Any], str, str]:
     settings = get_claude_settings()
     claude_model = str(payload.get("model") or "").strip()
-    upstream_model = resolve_claude_model(claude_model, settings.model_mappings)
+    upstream_model = resolve_claude_model(claude_model, model_mappings or settings.model_mappings)
     if not upstream_model:
         raise HTTPException(status_code=400, detail=f"Claude model mapping is not configured for {claude_model or '<empty>'}")
     upstream_payload = dict(payload)
@@ -170,12 +170,14 @@ async def create_claude_message(request: Request, payload: dict[str, Any]) -> di
     return body
 
 
-async def create_claude_message_with_metadata(request: Request, payload: dict[str, Any]) -> tuple[dict[str, Any], str, str, str | None]:
+async def create_claude_message_with_metadata(
+    request: Request, payload: dict[str, Any], model_mappings: list[dict[str, str]] | None = None
+) -> tuple[dict[str, Any], str, str, str | None]:
     settings = get_claude_settings()
     if not settings.upstream_api_key:
         raise HTTPException(status_code=500, detail="Claude upstream API key is not configured")
 
-    upstream_payload, claude_model, upstream_model = mapped_claude_payload(payload)
+    upstream_payload, claude_model, upstream_model = mapped_claude_payload(payload, model_mappings=model_mappings)
     timeout = httpx.Timeout(settings.request_timeout_seconds)
     fallback_reason = None
     async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
@@ -571,7 +573,13 @@ def create_app() -> FastAPI:
     @app.post("/admin/claude/protocol/check")
     async def claude_protocol_check(request: Request):
         settings = get_claude_settings()
-        model = str((await request.json()).get("model") or settings.model_mappings[0]["claude_model"])
+        data = await request.json()
+        model_mappings = [
+            {"claude_model": str(item.get("claude_model") or "").strip(), "upstream_model": str(item.get("upstream_model") or "").strip()}
+            for item in (data.get("model_mappings") or settings.model_mappings)
+            if isinstance(item, dict)
+        ]
+        model = str(data.get("model") or model_mappings[0]["claude_model"])
         payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}
         endpoint = f"{settings.upstream_base_url}/messages"
         if settings.upstream_api_style == "chat":
@@ -589,11 +597,13 @@ def create_app() -> FastAPI:
                 "messages_url": endpoint,
                 "resolved_api_style": "anthropic" if settings.upstream_api_style == "anthropic" else settings.upstream_api_style,
                 "fallback_reason": None,
-                "model": resolve_claude_model(model, settings.model_mappings),
+                "model": resolve_claude_model(model, model_mappings),
             },
         }
         try:
-            body, resolved_api_style, resolved_endpoint, fallback_reason = await create_claude_message_with_metadata(request, payload)
+            body, resolved_api_style, resolved_endpoint, fallback_reason = await create_claude_message_with_metadata(
+                request, payload, model_mappings=model_mappings
+            )
         except HTTPException as exc:
             result["error"] = exc.detail
             return JSONResponse(result, status_code=exc.status_code)
@@ -827,7 +837,7 @@ ADMIN_HTML = """
     .status-row { margin-top: 12px; }
     .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
     .compact-button { width: auto; flex: 0 0 auto; align-self: flex-start; }
-    .status { font-size: 14px; color: #255e2e; }
+    .status { font-size: 14px; color: #255e2e; white-space: pre-line; }
     .status-live { color: #9a3412; background: #fef3c7; border: 1px solid #fbbf24; border-radius: 6px; padding: 10px 12px; }
     .gateway-emphasis { color: #c2410c; }
     .status:not(:empty) { margin-top: 12px; }
@@ -992,15 +1002,7 @@ ADMIN_HTML = """
       <div class="actions">
         <button id="addMapping" class="secondary" type="button">添加映射</button>
         <button id="saveClaudeConfig" type="button">保存映射</button>
-      </div>
-      <div class="row">
-        <div>
-          <label for="claudeTestModel">验证模型名</label>
-          <div class="inline-control">
-            <input id="claudeTestModel" placeholder="claude-opus-4.6">
-            <button id="checkClaudeModel" class="secondary" type="button">验证模型</button>
-          </div>
-        </div>
+        <button id="checkClaudeModel" class="secondary" type="button">验证模型</button>
       </div>
       <div class="status-row">
         <div id="claudeModelStatus" class="status"></div>
@@ -1227,9 +1229,6 @@ ADMIN_HTML = """
       $('claudeApiStyle').value = currentConfig.claude.api_style || 'auto';
       $('claudeGatewayUrl').textContent = currentConfig.claude.base_url;
       currentMappings = (currentConfig.claude.model_mappings || []).map((mapping) => ({ ...mapping }));
-      if (currentMappings.length && !$('claudeTestModel').value) {
-        $('claudeTestModel').value = currentMappings[0].claude_model;
-      }
       renderMappings();
     }
 
@@ -1577,15 +1576,40 @@ ADMIN_HTML = """
     $('checkClaudeModel').onclick = async () => {
       const button = $('checkClaudeModel');
       setButtonLoading(button, true, '验证中...', '验证模型');
-      $('claudeModelStatus').textContent = '正在验证 Claude 模型，请稍候。';
+      const mappingsToCheck = currentMappings.map((mapping) => ({
+        claude_model: String(mapping.claude_model || '').trim(),
+        upstream_model: String(mapping.upstream_model || '').trim(),
+      }));
+      const incompleteIndex = mappingsToCheck.findIndex((mapping) => !mapping.claude_model || !mapping.upstream_model);
+      if (incompleteIndex >= 0) {
+        $('claudeModelStatus').textContent = `请先补全第 ${incompleteIndex + 1} 条模型映射。`;
+        setButtonLoading(button, false, '验证中...', '验证模型');
+        return;
+      }
+      if (!mappingsToCheck.length) {
+        $('claudeModelStatus').textContent = '请先添加至少一条模型映射。';
+        setButtonLoading(button, false, '验证中...', '验证模型');
+        return;
+      }
+      $('claudeModelStatus').textContent = '正在验证 Claude 模型映射，请稍候。';
       try {
-        const res = await fetch('/admin/claude/protocol/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: $('claudeTestModel').value }) });
-        const body = await res.json();
-        if (res.ok && body.ok) {
-          $('claudeModelStatus').textContent = `验证通过：Gateway ${body.claude_desktop.base_url}；上游 ${body.upstream.messages_url}；模型映射到 ${body.upstream.model}。`;
-        } else {
-          $('claudeModelStatus').textContent = `验证失败：${body.error || '请求失败'}`;
+        const lines = [];
+        for (const [index, mapping] of mappingsToCheck.entries()) {
+          const res = await fetch('/admin/claude/protocol/check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: mapping.claude_model, model_mappings: mappingsToCheck }),
+          });
+          const body = await res.json();
+          if (res.ok && body.ok) {
+            lines.push(
+              `${index + 1}. ${mapping.claude_model} -> ${mapping.upstream_model}：通过；Gateway ${body.claude_desktop.base_url}；上游 ${body.upstream.messages_url}；模型映射到 ${body.upstream.model}。`
+            );
+          } else {
+            lines.push(`${index + 1}. ${mapping.claude_model} -> ${mapping.upstream_model}：失败；${body.error || '请求失败'}`);
+          }
         }
+        $('claudeModelStatus').textContent = lines.join('\\n');
       } catch (error) {
         $('claudeModelStatus').textContent = `验证失败：${error.message}`;
       } finally {
