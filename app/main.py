@@ -815,6 +815,8 @@ ADMIN_HTML = """
     .inline-control { height: 42px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: stretch; }
     .inline-control select, .inline-control button { height: 42px; }
     .inline-control button { margin: 0; white-space: nowrap; }
+    .inline-actions { height: 42px; display: flex; gap: 8px; align-items: stretch; }
+    .inline-actions button { width: auto; flex: 0 0 auto; margin: 0; white-space: nowrap; }
     .label-note { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
     .label-note label { margin-bottom: 0; }
     .label-note .muted { margin: 0; white-space: nowrap; }
@@ -824,7 +826,10 @@ ADMIN_HTML = """
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
     .status-row { margin-top: 12px; }
     .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    .compact-button { width: auto; flex: 0 0 auto; align-self: flex-start; }
     .status { font-size: 14px; color: #255e2e; }
+    .status-live { color: #9a3412; background: #fef3c7; border: 1px solid #fbbf24; border-radius: 6px; padding: 10px 12px; }
+    .gateway-emphasis { color: #c2410c; }
     .status:not(:empty) { margin-top: 12px; }
     .status:empty { display: none; }
     .muted { color: #697386; font-size: 13px; }
@@ -912,7 +917,6 @@ ADMIN_HTML = """
               <option value="chat">v1/chat/completions</option>
               <option value="responses">v1/responses</option>
             </select>
-            <button id="checkCodexProtocol" class="secondary" type="button">验证</button>
           </div>
         </div>
       </div>
@@ -926,7 +930,10 @@ ADMIN_HTML = """
         </div>
         <div>
           <label>&nbsp;</label>
-          <button id="codexRefreshModels" class="secondary" type="button">刷新模型</button>
+          <div class="inline-actions">
+            <button id="codexRefreshModels" class="secondary" type="button">刷新模型</button>
+            <button id="checkCodexProtocol" class="secondary" type="button">验证模型</button>
+          </div>
         </div>
       </div>
       <p class="muted">默认模型属于当前中转平台配置；若另一侧也使用该平台，候选模型列表会同步更新。</p>
@@ -970,20 +977,16 @@ ADMIN_HTML = """
               <option value="chat">v1/chat/completions</option>
               <option value="auto">Auto</option>
             </select>
-            <button id="checkClaudeProtocol" class="secondary" type="button">验证</button>
           </div>
         </div>
       </div>
-      <div class="status-row">
-        <div id="claudeProtocolStatus" class="status"></div>
-      </div>
-      <p class="muted">Claude Desktop Developer Mode 的 Gateway URL填：<code id="claudeGatewayUrl"></code>。API Key可填任意非空值。</p>
+      <p class="muted">Claude Desktop Developer Mode 的 Gateway URL填：<code id="claudeGatewayUrl" class="gateway-emphasis"></code>。API Key可填任意非空值。</p>
       <div class="title-row" style="margin-top: 14px;">
         <div>
           <label style="margin-top: 0;">模型映射</label>
           <p class="muted" style="margin: 6px 0 0;">右侧模型可直接输入，也可从刷新后的候选列表中选择；保存时只影响模型映射。</p>
         </div>
-        <button id="claudeRefreshModels" class="secondary" type="button">刷新模型</button>
+        <button id="claudeRefreshModels" class="secondary compact-button" type="button">刷新模型</button>
       </div>
       <div id="mappingRows"></div>
       <div class="actions">
@@ -1036,7 +1039,7 @@ ADMIN_HTML = """
 
     function setUiBusy(isBusy) {
       uiBusy = isBusy;
-      ['profileSelect', 'codexApiStyle', 'claudeProfileSelect', 'claudeApiStyle', 'codexDefaultModel', 'codexRefreshModels', 'claudeRefreshModels', 'saveClaudeConfig', 'addMapping', 'checkClaudeProtocol', 'checkClaudeModel'].forEach((id) => {
+      ['profileSelect', 'codexApiStyle', 'claudeProfileSelect', 'claudeApiStyle', 'codexDefaultModel', 'codexRefreshModels', 'claudeRefreshModels', 'saveClaudeConfig', 'addMapping', 'checkClaudeModel', 'checkCodexProtocol'].forEach((id) => {
         const element = $(id);
         if (element) {
           element.disabled = isBusy;
@@ -1177,6 +1180,12 @@ ADMIN_HTML = """
         }
       }
       return `验证通过：使用 ${resolvedLabel}；上游 ${body.upstream.messages_url || body.upstream.protocol_url}。`;
+    }
+
+    function setClaudeStatus(text, isLive = false) {
+      const element = $('claudeStatus');
+      element.textContent = text;
+      element.classList.toggle('status-live', Boolean(text) && isLive);
     }
 
     function currentCodexProfile() {
@@ -1328,7 +1337,7 @@ ADMIN_HTML = """
 
     async function saveClaudeSelection(statusText) {
       setUiBusy(true);
-      $('claudeStatus').textContent = statusText;
+      setClaudeStatus(statusText);
       try {
         const payload = {
           active_profile: $('claudeProfileSelect').value,
@@ -1337,10 +1346,10 @@ ADMIN_HTML = """
         };
         const res = await fetch('/admin/claude/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         const body = await res.json();
-        $('claudeStatus').textContent = res.ok ? 'ClaudeProxy 当前配置已生效。' : `切换失败：${body.detail}`;
+        setClaudeStatus(res.ok ? 'ClaudeProxy 当前配置已生效。' : `切换失败：${body.detail}`, res.ok);
         await refresh();
       } catch (error) {
-        $('claudeStatus').textContent = `切换失败：${error.message}`;
+        setClaudeStatus(`切换失败：${error.message}`);
       } finally {
         setUiBusy(false);
       }
@@ -1465,8 +1474,8 @@ ADMIN_HTML = """
 
     $('checkCodexProtocol').onclick = async () => {
       const button = $('checkCodexProtocol');
-      setButtonLoading(button, true, '验证中...', '验证');
-      $('codexProtocolStatus').textContent = '正在验证 Codex 上游协议，请稍候。';
+      setButtonLoading(button, true, '验证中...', '验证模型');
+      $('codexProtocolStatus').textContent = '正在验证 Codex 模型，请稍候。';
       try {
         const res = await fetch('/admin/codex/protocol/check', { method: 'POST' });
         const body = await res.json();
@@ -1478,7 +1487,7 @@ ADMIN_HTML = """
       } catch (error) {
         $('codexProtocolStatus').textContent = `验证失败：${error.message}`;
       } finally {
-        setButtonLoading(button, false, '验证中...', '验证');
+        setButtonLoading(button, false, '验证中...', '验证模型');
       }
     };
 
@@ -1523,7 +1532,7 @@ ADMIN_HTML = """
       const button = $('saveClaudeConfig');
       setButtonLoading(button, true, '保存中...', '保存映射');
       setUiBusy(true);
-      $('claudeStatus').textContent = '正在保存 ClaudeProxy 模型映射，请稍候。';
+      setClaudeStatus('正在保存 ClaudeProxy 模型映射，请稍候。');
       try {
         const payload = {
           active_profile: $('claudeProfileSelect').value,
@@ -1532,10 +1541,10 @@ ADMIN_HTML = """
         };
         const res = await fetch('/admin/claude/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         const body = await res.json();
-        $('claudeStatus').textContent = res.ok ? '保存成功，ClaudeProxy 模型映射已生效。' : `保存失败：${body.detail}`;
+        setClaudeStatus(res.ok ? '保存成功，ClaudeProxy 当前配置已生效。' : `保存失败：${body.detail}`, res.ok);
         await refresh();
       } catch (error) {
-        $('claudeStatus').textContent = `保存失败：${error.message}`;
+        setClaudeStatus(`保存失败：${error.message}`);
       } finally {
         setUiBusy(false);
         setButtonLoading(button, false, '保存中...', '保存映射');
@@ -1546,41 +1555,22 @@ ADMIN_HTML = """
       const button = $('claudeRefreshModels');
       setButtonLoading(button, true, '刷新中...', '刷新模型');
       setUiBusy(true);
-      $('claudeStatus').textContent = '正在刷新模型，请稍候。';
+      setClaudeStatus('正在刷新模型，请稍候。');
       try {
         const res = await fetch(`/admin/profiles/${encodeURIComponent($('claudeProfileSelect').value)}/models/refresh?namespace=claude`, { method: 'POST' });
         const body = await res.json();
         if (res.ok) {
           await refresh();
-          $('claudeStatus').textContent = '模型列表已刷新。';
+          setClaudeStatus('模型列表已刷新。');
           claudeModelPickers.forEach((picker) => picker.render());
         } else {
-          $('claudeStatus').textContent = `刷新失败：${body.detail || '请求失败'}`;
+          setClaudeStatus(`刷新失败：${body.detail || '请求失败'}`);
         }
       } catch (error) {
-        $('claudeStatus').textContent = `刷新失败：${error.message}`;
+        setClaudeStatus(`刷新失败：${error.message}`);
       } finally {
         setUiBusy(false);
         setButtonLoading(button, false, '刷新中...', '刷新模型');
-      }
-    };
-
-    $('checkClaudeProtocol').onclick = async () => {
-      const button = $('checkClaudeProtocol');
-      setButtonLoading(button, true, '验证中...', '验证');
-      $('claudeProtocolStatus').textContent = '正在验证 Claude 上游协议，请稍候。';
-      try {
-        const res = await fetch('/admin/claude/protocol/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
-        const body = await res.json();
-        if (res.ok && body.ok) {
-          $('claudeProtocolStatus').textContent = `验证通过：Gateway ${body.claude_desktop.base_url}；${formatProtocolSuccess(body).replace('验证通过：', '')}`;
-        } else {
-          $('claudeProtocolStatus').textContent = `验证失败：${body.error || '请求失败'}`;
-        }
-      } catch (error) {
-        $('claudeProtocolStatus').textContent = `验证失败：${error.message}`;
-      } finally {
-        setButtonLoading(button, false, '验证中...', '验证');
       }
     };
 

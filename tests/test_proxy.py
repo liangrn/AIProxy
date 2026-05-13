@@ -1512,14 +1512,14 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert "修改中..." in text
     assert "恢复中..." in text
     assert 'id="checkCodexProtocol"' in text
-    assert 'id="checkClaudeProtocol"' in text
     assert 'id="checkClaudeModel"' in text
     assert 'id="codexProtocolStatus"' in text
-    assert 'id="claudeProtocolStatus"' in text
     assert 'id="claudeModelStatus"' in text
     assert 'id="claudeStatus"' in text
     assert '.status:empty' in text
     assert '.status-row' in text
+    assert '.status-live { color: #9a3412; background: #fef3c7; border: 1px solid #fbbf24;' in text
+    assert '.gateway-emphasis { color: #c2410c; }' in text
     assert 'query = input.value.trim().toLowerCase();' not in text
     assert "models.filter((model) => model.toLowerCase().includes(query))" not in text
     assert "try {" in text
@@ -1541,12 +1541,20 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert text.count("选择后自动生效。") == 2
     assert "没有匹配的模型" not in text
     assert 'datalist' not in text
+    assert '<button id="checkCodexProtocol" class="secondary" type="button">验证模型</button>' in text
+    assert '<div class="inline-actions">' in text
     dialog = text.split('<dialog id="profileDialog">', 1)[1].split("</dialog>", 1)[0]
     assert "默认模型" not in dialog
     assert "刷新模型" not in dialog
     claude_panel = text.split('<section class="claude-panel panel-hidden">', 1)[1].split("</section>", 1)[0]
-    assert '<button id="claudeRefreshModels" class="secondary" type="button">刷新模型</button>' in claude_panel
+    assert '<code id="claudeGatewayUrl" class="gateway-emphasis"></code>' in claude_panel
+    assert '<button id="claudeRefreshModels" class="secondary compact-button" type="button">刷新模型</button>' in claude_panel
+    assert 'id="checkClaudeProtocol"' not in claude_panel
+    assert 'id="claudeProtocolStatus"' not in claude_panel
     assert "右侧模型可直接输入，也可从刷新后的候选列表中选择；保存时只影响模型映射。" in claude_panel
+    assert "ClaudeProxy 当前配置已生效。" in text
+    assert "保存成功，ClaudeProxy 当前配置已生效。" in text
+    assert "保存成功，ClaudeProxy 模型映射已生效。" not in text
     assert "v1/messages 不可用，已自动适配 v1/chat/completions" in text
     assert "v1/responses 不可用，已自动适配 v1/chat/completions" in text
 
@@ -1643,6 +1651,41 @@ def test_saving_codex_profile_default_model_keeps_claude_mappings(monkeypatch, t
     assert config["claude"]["model_mappings"] == [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}]
 
 
+def test_saving_codex_profile_default_model_does_not_append_to_models(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/shared",
+        json={
+            "name": "Shared Provider",
+            "base_url": "https://shared.example",
+            "api_key": "shared-key",
+            "default_model": "gpt-5.5",
+            "models": ["gpt-5.5", "gpt-5.4"],
+        },
+    )
+
+    response = client.post(
+        "/admin/profiles/shared?namespace=codex",
+        json={
+            "name": "Shared Provider",
+            "base_url": "https://shared.example",
+            "api_key": "shared-key",
+            "default_model": "custom-model",
+            "models": ["gpt-5.5", "gpt-5.4"],
+            "user_agent": "curl/8.7.1",
+            "timeout_seconds": 300,
+        },
+    )
+
+    assert response.status_code == 200
+    config = client.get("/admin/config").json()["config"]
+    assert config["profiles"]["shared"]["default_model"] == "custom-model"
+    assert config["profiles"]["shared"]["models"] == ["gpt-5.5", "gpt-5.4"]
+
+
 def test_saving_claude_config_does_not_override_profile_default_model(monkeypatch, tmp_path):
     config_path = tmp_path / "config.local.json"
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
@@ -1671,6 +1714,40 @@ def test_saving_claude_config_does_not_override_profile_default_model(monkeypatc
     config = client.get("/admin/config").json()["config"]
     assert config["profiles"]["byte"]["default_model"] == "gpt-5.5"
     assert config["claude"]["model_mappings"] == [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}]
+
+
+def test_admin_config_does_not_inject_default_model_into_profile_models(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    config_path.write_text(
+        json.dumps(
+            {
+                "profiles": {
+                    "shared": {
+                        "name": "Shared Provider",
+                        "base_url": "https://shared.example/v1",
+                        "api_key": "shared-key",
+                        "default_model": "custom-model",
+                        "models": ["gpt-5.5", "gpt-5.4"],
+                        "user_agent": "curl/8.7.1",
+                        "timeout_seconds": 300,
+                    }
+                },
+                "codex": {"active_profile": "shared", "api_style": "auto"},
+                "claude": {"active_profile": "shared", "api_style": "auto", "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    client = TestClient(create_app())
+
+    response = client.get("/admin/config")
+
+    assert response.status_code == 200
+    config = response.json()["config"]
+    assert config["profiles"]["shared"]["default_model"] == "custom-model"
+    assert config["profiles"]["shared"]["models"] == ["gpt-5.5", "gpt-5.4"]
 
 
 def test_protocol_check_reports_codex_and_upstream_contract(monkeypatch, tmp_path):

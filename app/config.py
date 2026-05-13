@@ -200,7 +200,7 @@ def default_profile() -> dict[str, Any]:
     )
 
 
-def normalize_profile(data: dict[str, Any], current: dict[str, Any] | None = None, ensure_default_model: bool = True) -> dict[str, Any]:
+def normalize_profile(data: dict[str, Any], current: dict[str, Any] | None = None, ensure_default_model: bool = False) -> dict[str, Any]:
     current = current or {}
     default_model = str(
         data.get("default_model")
