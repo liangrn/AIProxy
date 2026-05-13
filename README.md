@@ -2,37 +2,57 @@
 
 AIProxy 是给 Codex Desktop 和 Claude Desktop 使用的本地中转代理。
 
-它对 Codex Desktop 暴露 `/v1/responses`。上游平台如果原生支持 Responses 协议，就直接透传；如果只支持 OpenAI-compatible 的 `/v1/chat/completions`，就自动或按配置走协议转换，把 Chat Completions 的流式输出转换成 Codex 需要的 Responses SSE 事件，确保流式响应以 `response.completed` 正常结束。
+它做两件事：
 
-## 功能
+- 对 Codex Desktop 暴露 `/v1/responses`。上游支持 `v1/responses` 就直连；只支持 `v1/chat/completions` 时会自动转换。
+- 对 Claude Desktop 暴露 `/anthropic/v1/messages`。上游支持 `v1/messages` 就直连；不支持时可自动回退到 `v1/chat/completions`。
 
-- 支持配置任意 OpenAI-compatible 中转平台。
-- 默认示例使用“字节跳动”平台和 `glm-5.1` 模型。
-- 支持非流式 `/v1/responses`。
-- 支持流式 `/v1/responses`，尾部会补齐 `response.completed` 和 `[DONE]`。
-- 支持在 Codex 和 Claude 页面分别配置各自的上游协议。
-- 提供 `/healthz` 健康检查。
-- 提供本地管理页，可动态设置多个中转平台、刷新模型并切换当前生效配置。
-- 提供 Codex Desktop 配置安装和恢复脚本。
-- 密钥通过 `.env` 或进程环境变量传入，不写入代码。
+## 你会得到什么
 
-## 环境
+- 一个本地管理页：添加平台、刷新模型、切换当前平台。
+- Codex 和 Claude 共用平台列表，但各自独立选择当前平台和上游协议。
+- Codex 默认 `Auto`：优先 `v1/responses`，不支持时回退 `v1/chat/completions`。
+- Claude 默认 `Auto`：优先 `v1/messages`，不支持时回退 `v1/chat/completions`。
+- Codex Desktop 配置一键安装、恢复原始配置。
+- 所有本地运行时配置保存在 `config.local.json`，不会提交到仓库。
 
-在你自己的 Python 环境中安装依赖：
+## 快速开始
+
+1. 安装依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 配置
-
-创建本地环境配置：
+2. 准备环境变量：
 
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env`：
+3. 启动服务：
+
+```bash
+./start.sh
+```
+
+4. 打开管理页：
+
+```text
+http://127.0.0.1:8383/
+```
+
+普通用户建议直接走管理页，不必手改 `config.local.json`。
+
+## 配置
+
+第一次启动前，只需要准备 `.env`：
+
+```bash
+cp .env.example .env
+```
+
+最小可用示例：
 
 ```bash
 UPSTREAM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding
@@ -46,9 +66,7 @@ LISTEN_PORT=8383
 REQUEST_TIMEOUT_SECONDS=300
 ```
 
-不要提交 `.env`，里面有密钥。管理页保存的 `config.local.json` 同样会被 `.gitignore` 忽略。
-
-如果要换成其他中转平台，只需要改这些字段：
+常用字段只有这些：
 
 ```bash
 UPSTREAM_PROVIDER_NAME=你的平台名称
@@ -70,48 +88,48 @@ https://ark.cn-beijing.volces.com/api/coding
 https://ark.cn-beijing.volces.com/api/coding/v1
 ```
 
-如果平台走 `chat` 协议，要求上游兼容 OpenAI Chat Completions streaming，也就是支持：
+如果平台要走 `v1/chat/completions`，上游必须支持 streaming：
 
 ```text
 POST /v1/chat/completions
 stream: true
 ```
 
-也可以启动服务后打开本地管理页配置：
-
-```text
-http://127.0.0.1:8383/
-```
-
 管理页保存的配置会写入本地 `config.local.json`。该文件优先级高于 `.env`，保存后新的代理请求会立即使用当前生效配置。
 
 如果要自定义运行时配置文件路径，可以设置 `AIPROXY_CONFIG_PATH`。旧的 `CODEXPROXY_CONFIG_PATH` 仍然兼容，但新配置建议使用 `AIPROXY_CONFIG_PATH`。
 
-管理页支持多个共享中转配置。Codex 和 Claude 共用同一组平台列表，但各自选择当前生效的平台，互不影响。
+不要提交 `.env`。管理页保存的 `config.local.json` 同样会被 `.gitignore` 忽略。
 
-Codex 页和 Claude 页会分别配置各自的“上游协议”：
+## 管理页怎么配
+
+管理页支持多个共享中转平台。Codex 和 Claude 共用同一组平台列表，但各自选择当前生效的平台，互不影响。
+
+### 上游协议
 
 - `v1/chat/completions`：固定走 `{平台地址}/v1/chat/completions`
 - `v1/responses`：固定走 `{平台地址}/v1/responses`
-- `Auto`：Codex 优先尝试原生 `responses`，Claude 优先尝试 `messages`，不支持时回退到 `chat/completions`
+- `Auto`：Codex 优先尝试 `v1/responses`，Claude 优先尝试 `v1/messages`，不支持时回退到 `v1/chat/completions`
 - `v1/messages`：Claude 固定透传 `{平台地址}/messages`
 
-管理页的模型流程：
+协议验证结果会明确告诉你：
 
-- 先在“添加中转平台”里填写平台名称、平台地址和 API Key，并保存。
-- `CodexProxy` 页会在“选择中转平台”下方显示“默认模型”和“刷新模型”。
-- `CodexProxy` 点击“刷新模型”后，AIProxy 会请求当前平台的 `/v1/models`，并更新当前平台的模型候选列表。
-- `CodexProxy` 的“默认模型”下拉框会展示当前平台的完整模型列表；选择后会直接保存到当前平台配置，并立即生效。
-- `ClaudeProxy` 不单独维护默认模型；它只维护“模型映射”。
-- `ClaudeProxy` 的“模型映射”标题右侧提供“刷新模型”，点击后同样会请求当前平台的 `/v1/models`，并更新当前平台的模型候选列表。
-- `ClaudeProxy` 每条映射右侧的上游模型输入框支持直接手输，也支持展开后从当前平台的完整模型列表中选择。
-- `ClaudeProxy` 保存映射时，只会更新模型映射，不会覆盖当前平台的默认模型。
-- 如果 `Codex` 和 `Claude` 使用同一个中转平台，任一侧刷新模型后，另一侧看到的候选模型列表也会同步更新。
+- 当前实际用了哪个协议
+- 如果优先协议不支持，是否已自动回退
+- 当前验证命中的上游 URL
 
-管理页提供“验证配置”按钮，用来检查平台模型接口是否可用：
+### 模型和映射
 
-- 本地代理地址会显示为 `http://127.0.0.1:8383/v1`。
-- 上游平台侧固定使用 `{平台地址}/v1/models` 读取模型并统计模型数量。
+- 先添加平台，再点“刷新模型”。
+- Codex 的“默认模型”从当前平台模型列表里选，选择后立即生效。
+- Claude 不维护默认模型，只维护“Claude 模型名 -> 上游真实模型名”映射。
+- Claude 的映射右侧可以手输，也可以从刷新后的模型列表里选。
+- 如果 Codex 和 Claude 使用同一个平台，一侧刷新模型后，另一侧候选列表也会同步更新。
+
+### 验证配置
+
+- 平台弹窗里的“验证配置”只检查 `{平台地址}/v1/models` 是否可用。
+- Codex 和 Claude 区块里的“验证”检查的是当前协议链路是否可用。
 
 API Key 会直接显示在管理页中，方便本机维护配置。不要把管理页监听到公网或局域网。
 
@@ -149,7 +167,7 @@ nohup ./start.sh > aiproxy.log 2>&1 &
 ./restart.sh
 ```
 
-如果只是修改中转平台、API Key、默认模型或 Claude 模型映射，不需要重启，管理页保存后会立即生效。如果修改了 `.env` 里的 `LISTEN_HOST` 或 `LISTEN_PORT`，需要重启。
+如果只是修改中转平台、API Key、默认模型、协议或 Claude 模型映射，不需要重启，管理页保存后会立即生效。如果修改了 `.env` 里的 `LISTEN_HOST` 或 `LISTEN_PORT`，需要重启。
 
 ## 验证代理
 
@@ -286,9 +304,13 @@ ClaudeProxy 页面的映射交互规则：
 - 点击“刷新模型”只会更新右侧候选列表，不会自动改写已经填写的映射值。
 - 如果某个已填的上游模型不在新拉取的候选列表中，原值会保留，仍然可以继续保存。
 
-请求进入本地代理后，只会把 Anthropic Messages 请求体中的 `model` 改写为映射后的真实模型，其他字段尽量原样透传到上游 `{平台地址}/messages`。上游响应里的 `model` 会在非流式响应中改回 Claude Desktop 请求的模型名。
+请求进入本地代理后，会先把 Claude 请求模型名映射成上游真实模型名，再按当前协议转发。
 
-ClaudeProxy v1 默认使用 Anthropic Messages 透传模式，已经适合支持 `/messages` 的中转平台，例如当前“字节跳动”配置。Chat Completions 协议转换、多模态和工具调用的深度转换不作为 v1 目标。
+- 如果当前协议是 `v1/messages`，就直接转到上游 `/messages`
+- 如果当前协议是 `v1/chat/completions`，就转成 Chat Completions 请求
+- 如果当前协议是 `Auto`，优先试 `v1/messages`，不支持时自动回退到 `v1/chat/completions`
+
+当前版本重点覆盖文本对话链路。多模态和工具调用的深度转换不在这版目标里。
 
 ## 恢复默认配置
 

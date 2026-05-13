@@ -653,6 +653,97 @@ def test_claude_auto_protocol_falls_back_to_chat_when_messages_unsupported(monke
     assert response.json()["content"] == [{"type": "text", "text": "fallback ok"}]
 
 
+def test_claude_auto_stream_falls_back_to_chat_when_messages_unsupported(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    calls = []
+
+    class FakeStreamResponse:
+        def __init__(self, status_code, body=None, lines=None, headers=None):
+            self.status_code = status_code
+            self._body = body or b""
+            self._lines = lines or []
+            self.headers = headers or {"content-type": "application/json"}
+
+        async def aread(self):
+            return self._body
+
+        async def aiter_lines(self):
+            for line in self._lines:
+                yield line
+
+    class FakeStreamContext:
+        def __init__(self, response):
+            self.response = response
+
+        async def __aenter__(self):
+            return self.response
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_stream(self, method, url, headers, json):
+        calls.append(url)
+        if url.endswith("/messages"):
+            body = b'{"error":{"message":"This group does not allow /v1/messages dispatch","type":"permission_error"},"type":"error"}'
+            return FakeStreamContext(FakeStreamResponse(403, body=body))
+        return FakeStreamContext(
+            FakeStreamResponse(
+                200,
+                lines=[
+                    'data: {"choices":[{"delta":{"content":"fall"},"finish_reason":null}]}',
+                    'data: {"choices":[{"delta":{"content":"back"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}',
+                    "data: [DONE]",
+                ],
+                headers={"content-type": "text/event-stream"},
+            )
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "stream", fake_stream)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/aigocode",
+        json={
+            "name": "AiGoCode",
+            "base_url": "https://api.aigocode.com/v1",
+            "api_key": "aigocode-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "aigocode",
+            "api_style": "auto",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    with client.stream(
+        "POST",
+        "/anthropic/v1/messages",
+        json={
+            "model": "claude-opus-4.6",
+            "max_tokens": 8,
+            "stream": True,
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+    ) as response:
+        assert response.status_code == 200
+        text = "".join(response.iter_text())
+
+    assert calls == [
+        "https://api.aigocode.com/v1/messages",
+        "https://api.aigocode.com/v1/chat/completions",
+    ]
+    assert 'event: content_block_delta' in text
+    assert '"text":"fall"' in text
+    assert '"text":"back"' in text
+    assert 'event: message_stop' in text
+
+
 def test_claude_models_expose_mapped_claude_names(monkeypatch, tmp_path):
     monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(tmp_path / "config.local.json"))
 
@@ -773,6 +864,64 @@ def test_claude_protocol_check_uses_selected_chat_protocol(monkeypatch, tmp_path
     assert body["ok"] is True
     assert body["upstream"]["messages_url"] == "https://api.aigocode.com/v1/chat/completions"
     assert body["response_model"] == "claude-opus-4.6"
+
+
+def test_claude_protocol_check_reports_auto_fallback_to_chat(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+    calls = []
+
+    async def fake_post(self, url, headers, json):
+        calls.append(url)
+        if url.endswith("/messages"):
+            return httpx.Response(
+                403,
+                json={"error": {"message": "This group does not allow /v1/messages dispatch", "type": "permission_error"}, "type": "error"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat_1",
+                "model": "glm-5.1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/aigocode",
+        json={
+            "name": "AiGoCode",
+            "base_url": "https://api.aigocode.com/v1",
+            "api_key": "aigocode-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "aigocode",
+            "api_style": "auto",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post("/admin/claude/protocol/check", json={"model": "claude-opus-4.6"})
+
+    assert response.status_code == 200
+    assert calls == [
+        "https://api.aigocode.com/v1/messages",
+        "https://api.aigocode.com/v1/chat/completions",
+    ]
+    body = response.json()
+    assert body["ok"] is True
+    assert body["upstream"]["resolved_api_style"] == "chat"
+    assert body["upstream"]["messages_url"] == "https://api.aigocode.com/v1/chat/completions"
+    assert body["upstream"]["fallback_reason"] == "v1/messages is not supported by the upstream provider"
 
 
 def test_admin_config_exposes_api_style(monkeypatch, tmp_path):
@@ -975,6 +1124,7 @@ def test_codex_protocol_check_auto_falls_back_to_chat(monkeypatch, tmp_path):
     assert body["ok"] is True
     assert body["upstream"]["resolved_api_style"] == "chat"
     assert body["upstream"]["protocol_url"] == "https://api.aigocode.com/v1/chat/completions"
+    assert body["upstream"]["fallback_reason"] == "v1/responses is not supported by the upstream provider"
 
 
 def test_refresh_models_updates_active_profile(monkeypatch, tmp_path):
@@ -1206,6 +1356,10 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert 'id="claudeStatus"' in text
     assert '.status:empty' in text
     assert '.status-row' in text
+    assert 'query = input.value.trim().toLowerCase();' in text
+    assert "models.filter((model) => model.toLowerCase().includes(query))" in text
+    assert "try {" in text
+    assert "finally {" in text
     assert "v1/responses" in text
     assert "v1/chat/completions" in text
     assert "v1/messages" in text
@@ -1217,12 +1371,11 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert "Responses" not in text
     assert "Chat Completions" not in text
     assert "Anthropic Messages" not in text
-    assert "自动适配" not in text
     assert text.count("选择中转平台") == 2
     assert "Claude 使用的中转平台" not in text
     assert "选择后自动生效。" in text
     assert text.count("选择后自动生效。") == 2
-    assert "没有匹配的模型" not in text
+    assert "没有匹配的模型" in text
     assert 'datalist' not in text
     dialog = text.split('<dialog id="profileDialog">', 1)[1].split("</dialog>", 1)[0]
     assert "默认模型" not in dialog
@@ -1230,6 +1383,8 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     claude_panel = text.split('<section class="claude-panel panel-hidden">', 1)[1].split("</section>", 1)[0]
     assert '<button id="claudeRefreshModels" class="secondary" type="button">刷新模型</button>' in claude_panel
     assert "右侧模型可直接输入，也可从刷新后的候选列表中选择；保存时只影响模型映射。" in claude_panel
+    assert "v1/messages 不可用，已自动适配 v1/chat/completions" in text
+    assert "v1/responses 不可用，已自动适配 v1/chat/completions" in text
 
 
 def test_refresh_profile_models_updates_selected_namespace_profile(monkeypatch, tmp_path):

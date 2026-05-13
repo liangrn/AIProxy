@@ -27,7 +27,7 @@ from .config import (
     update_profile_models,
     update_active_profile_models,
 )
-from .sse import chat_stream_to_responses_sse
+from .sse import chat_stream_to_anthropic_sse, chat_stream_to_responses_sse
 from scripts.codex_config import install as install_codex_config
 from scripts.codex_config import original_backup_path as codex_original_backup_path
 from scripts.codex_config import restore as restore_codex_config
@@ -166,12 +166,18 @@ def mapped_claude_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], str,
 
 
 async def create_claude_message(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+    body, _, _, _ = await create_claude_message_with_metadata(request, payload)
+    return body
+
+
+async def create_claude_message_with_metadata(request: Request, payload: dict[str, Any]) -> tuple[dict[str, Any], str, str, str | None]:
     settings = get_claude_settings()
     if not settings.upstream_api_key:
         raise HTTPException(status_code=500, detail="Claude upstream API key is not configured")
 
     upstream_payload, claude_model, upstream_model = mapped_claude_payload(payload)
     timeout = httpx.Timeout(settings.request_timeout_seconds)
+    fallback_reason = None
     async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
         if settings.upstream_api_style in {"anthropic", "auto"}:
             url = f"{settings.upstream_base_url}/messages"
@@ -184,9 +190,10 @@ async def create_claude_message(request: Request, payload: dict[str, Any]) -> di
                 if not isinstance(body, dict):
                     raise HTTPException(status_code=502, detail=f"Upstream returned unexpected JSON type for POST {url}")
                 body["model"] = claude_model
-                return body
+                return body, "anthropic", url, None
             if settings.upstream_api_style == "anthropic" or not is_unsupported_claude_messages_endpoint(response):
                 raise HTTPException(status_code=response.status_code, detail=response.text)
+            fallback_reason = "v1/messages is not supported by the upstream provider"
 
         chat_payload = anthropic_messages_to_chat_payload(payload, upstream_model, stream=False)
         url = f"{settings.upstream_base_url}/chat/completions"
@@ -194,7 +201,44 @@ async def create_claude_message(request: Request, payload: dict[str, Any]) -> di
     if response.status_code >= 400:
         raise HTTPException(status_code=response.status_code, detail=summarize_upstream_error(response, url))
     body = parse_upstream_json_response(response, url)
-    return chat_completion_to_anthropic_message(body, claude_model)
+    return chat_completion_to_anthropic_message(body, claude_model), "chat", url, fallback_reason
+
+
+async def stream_claude_chat_completion(request: Request, payload: dict[str, Any], upstream_model: str, requested_model: str):
+    settings = get_claude_settings()
+    headers = claude_upstream_headers(request, stream=True)
+    chat_payload = anthropic_messages_to_chat_payload(payload, upstream_model, stream=True)
+    timeout = httpx.Timeout(settings.request_timeout_seconds)
+    client = httpx.AsyncClient(timeout=timeout, http2=True)
+    stream_context = client.stream("POST", f"{settings.upstream_base_url}/chat/completions", headers=headers, json=chat_payload)
+    try:
+        response = await stream_context.__aenter__()
+    except Exception:
+        await client.aclose()
+        raise
+    if response.status_code >= 400:
+        body = await response.aread()
+        await stream_context.__aexit__(None, None, None)
+        await client.aclose()
+        raise HTTPException(status_code=response.status_code, detail=body.decode("utf-8", "replace"))
+
+    async def chunks():
+        try:
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line.removeprefix("data:").strip()
+                if not data:
+                    continue
+                if data == "[DONE]":
+                    yield "[DONE]"
+                    continue
+                yield json.loads(data)
+        finally:
+            await stream_context.__aexit__(None, None, None)
+            await client.aclose()
+
+    return chat_stream_to_anthropic_sse(chunks(), requested_model)
 
 
 async def stream_claude_message(request: Request, payload: dict[str, Any]):
@@ -202,7 +246,7 @@ async def stream_claude_message(request: Request, payload: dict[str, Any]):
     if not settings.upstream_api_key:
         raise HTTPException(status_code=500, detail="Claude upstream API key is not configured")
 
-    upstream_payload, _, upstream_model = mapped_claude_payload(payload)
+    upstream_payload, claude_model, upstream_model = mapped_claude_payload(payload)
     if settings.upstream_api_style in {"anthropic", "auto"}:
         url = f"{settings.upstream_base_url}/messages"
         headers = claude_messages_headers(request, stream=True)
@@ -232,8 +276,7 @@ async def stream_claude_message(request: Request, payload: dict[str, Any]):
         error_detail = body.decode("utf-8", "replace")
         if settings.upstream_api_style == "anthropic" or not is_unsupported_claude_messages_endpoint_body(response, error_detail):
             raise HTTPException(status_code=response.status_code, detail=error_detail)
-
-    raise HTTPException(status_code=501, detail="Claude Chat Completions streaming is not supported yet")
+    return await stream_claude_chat_completion(request, payload, upstream_model, claude_model)
 
 
 def is_unsupported_claude_messages_endpoint(response: httpx.Response) -> bool:
@@ -359,6 +402,7 @@ async def check_codex_upstream_protocol() -> dict[str, Any]:
             "configured_api_style": settings.upstream_api_style,
             "resolved_api_style": None,
             "protocol_url": None,
+            "fallback_reason": None,
             "model": settings.upstream_model,
         },
     }
@@ -376,6 +420,7 @@ async def check_codex_upstream_protocol() -> dict[str, Any]:
             if settings.upstream_api_style == "responses":
                 result["error"] = str(exc) or "Configured upstream responses endpoint is not supported"
                 return JSONResponse(result, status_code=502)
+            result["upstream"]["fallback_reason"] = "v1/responses is not supported by the upstream provider"
         except HTTPException as exc:
             result["error"] = exc.detail
             return JSONResponse(result, status_code=exc.status_code)
@@ -533,15 +578,20 @@ def create_app() -> FastAPI:
                 "provider": settings.upstream_provider_name,
                 "base_url": settings.upstream_base_url,
                 "messages_url": endpoint,
+                "resolved_api_style": "anthropic" if settings.upstream_api_style == "anthropic" else settings.upstream_api_style,
+                "fallback_reason": None,
                 "model": resolve_claude_model(model, settings.model_mappings),
             },
         }
         try:
-            body = await create_claude_message(request, payload)
+            body, resolved_api_style, resolved_endpoint, fallback_reason = await create_claude_message_with_metadata(request, payload)
         except HTTPException as exc:
             result["error"] = exc.detail
             return JSONResponse(result, status_code=exc.status_code)
         result["ok"] = True
+        result["upstream"]["resolved_api_style"] = resolved_api_style
+        result["upstream"]["messages_url"] = resolved_endpoint
+        result["upstream"]["fallback_reason"] = fallback_reason
         result["response_model"] = body.get("model")
         return result
 
@@ -1039,7 +1089,7 @@ ADMIN_HTML = """
       $('codexModelText').textContent = profile.default_model;
     }
 
-    function createModelPicker(input, menu, getModels, onSelect, getValue) {
+    function createModelPicker(input, menu, getModels, onSelect, getValue, onInput = null) {
       const picker = {
         input,
         menu,
@@ -1050,6 +1100,8 @@ ADMIN_HTML = """
 
       picker.render = () => {
         const models = getModels();
+        const query = input.value.trim().toLowerCase();
+        const visibleModels = query ? models.filter((model) => model.toLowerCase().includes(query)) : models;
         menu.innerHTML = '';
         if (!models.length) {
           const empty = document.createElement('div');
@@ -1058,14 +1110,21 @@ ADMIN_HTML = """
           menu.appendChild(empty);
           return;
         }
-        for (const model of models) {
+        if (!visibleModels.length) {
+          const empty = document.createElement('div');
+          empty.className = 'model-empty';
+          empty.textContent = '没有匹配的模型';
+          menu.appendChild(empty);
+          return;
+        }
+        for (const model of visibleModels) {
           const option = document.createElement('button');
           option.type = 'button';
           option.className = 'model-option' + (model === getValue() ? ' active' : '');
           option.textContent = model;
-          option.onclick = () => {
+          option.onclick = async () => {
             input.value = model;
-            onSelect(model);
+            await onSelect(model);
             picker.close();
             picker.render();
           };
@@ -1088,13 +1147,36 @@ ADMIN_HTML = """
         }
       });
       input.addEventListener('input', () => {
-        onSelect(input.value);
+        if (onInput) {
+          onInput(input.value);
+        }
         if (!uiBusy) {
           picker.open();
         }
       });
 
       return picker;
+    }
+
+    function protocolLabel(apiStyle) {
+      if (apiStyle === 'responses') return 'v1/responses';
+      if (apiStyle === 'chat') return 'v1/chat/completions';
+      if (apiStyle === 'anthropic') return 'v1/messages';
+      return 'Auto';
+    }
+
+    function formatProtocolSuccess(body) {
+      const fallbackReason = body.upstream.fallback_reason;
+      const resolvedLabel = protocolLabel(body.upstream.resolved_api_style);
+      if (fallbackReason) {
+        if (fallbackReason.includes('v1/messages')) {
+          return `验证通过：v1/messages 不可用，已自动适配 v1/chat/completions；上游 ${body.upstream.messages_url}。`;
+        }
+        if (fallbackReason.includes('v1/responses')) {
+          return `验证通过：v1/responses 不可用，已自动适配 v1/chat/completions；上游 ${body.upstream.protocol_url}；模型 ${body.upstream.model}。`;
+        }
+      }
+      return `验证通过：使用 ${resolvedLabel}；上游 ${body.upstream.messages_url || body.upstream.protocol_url}。`;
     }
 
     function currentCodexProfile() {
@@ -1111,8 +1193,11 @@ ADMIN_HTML = """
           $('codexDefaultModel'),
           $('codexModelMenu'),
           () => currentCodexProfile()?.models || [],
-          () => {},
-          () => $('codexDefaultModel').value
+          async () => {
+            await saveCodexDefaultModel();
+          },
+          () => $('codexDefaultModel').value,
+          null
         );
       }
       const profile = currentCodexProfile();
@@ -1165,7 +1250,10 @@ ADMIN_HTML = """
           (value) => {
             currentMappings[index].upstream_model = value;
           },
-          () => currentMappings[index].upstream_model || ''
+          () => currentMappings[index].upstream_model || '',
+          (value) => {
+            currentMappings[index].upstream_model = value;
+          }
         );
         claudeModelPickers.push(picker);
       });
@@ -1222,30 +1310,40 @@ ADMIN_HTML = """
     async function saveCodexConfig(statusText) {
       setUiBusy(true);
       $('codexProtocolStatus').textContent = statusText;
-      const payload = {
-        active_profile: $('profileSelect').value,
-        api_style: $('codexApiStyle').value
-      };
-      const res = await fetch('/admin/codex/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      const body = await res.json();
-      $('codexProtocolStatus').textContent = res.ok ? 'Codex 当前配置已生效。' : `切换失败：${body.detail}`;
-      await refresh();
-      setUiBusy(false);
+      try {
+        const payload = {
+          active_profile: $('profileSelect').value,
+          api_style: $('codexApiStyle').value
+        };
+        const res = await fetch('/admin/codex/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        const body = await res.json();
+        $('codexProtocolStatus').textContent = res.ok ? 'Codex 当前配置已生效。' : `切换失败：${body.detail}`;
+        await refresh();
+      } catch (error) {
+        $('codexProtocolStatus').textContent = `切换失败：${error.message}`;
+      } finally {
+        setUiBusy(false);
+      }
     }
 
     async function saveClaudeSelection(statusText) {
       setUiBusy(true);
       $('claudeStatus').textContent = statusText;
-      const payload = {
-        active_profile: $('claudeProfileSelect').value,
-        api_style: $('claudeApiStyle').value,
-        model_mappings: currentMappings
-      };
-      const res = await fetch('/admin/claude/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      const body = await res.json();
-      $('claudeStatus').textContent = res.ok ? 'ClaudeProxy 当前配置已生效。' : `切换失败：${body.detail}`;
-      await refresh();
-      setUiBusy(false);
+      try {
+        const payload = {
+          active_profile: $('claudeProfileSelect').value,
+          api_style: $('claudeApiStyle').value,
+          model_mappings: currentMappings
+        };
+        const res = await fetch('/admin/claude/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        const body = await res.json();
+        $('claudeStatus').textContent = res.ok ? 'ClaudeProxy 当前配置已生效。' : `切换失败：${body.detail}`;
+        await refresh();
+      } catch (error) {
+        $('claudeStatus').textContent = `切换失败：${error.message}`;
+      } finally {
+        setUiBusy(false);
+      }
     }
 
     $('profileSelect').onchange = async () => {
@@ -1373,7 +1471,7 @@ ADMIN_HTML = """
         const res = await fetch('/admin/codex/protocol/check', { method: 'POST' });
         const body = await res.json();
         if (res.ok && body.ok) {
-          $('codexProtocolStatus').textContent = `验证通过：${body.upstream.provider} 使用 ${body.upstream.resolved_api_style}；上游 ${body.upstream.protocol_url}；模型 ${body.upstream.model}。`;
+          $('codexProtocolStatus').textContent = formatProtocolSuccess(body);
         } else {
           $('codexProtocolStatus').textContent = `验证失败：${body.error || '请求失败'}`;
         }
@@ -1475,7 +1573,7 @@ ADMIN_HTML = """
         const res = await fetch('/admin/claude/protocol/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
         const body = await res.json();
         if (res.ok && body.ok) {
-          $('claudeProtocolStatus').textContent = `验证通过：Gateway ${body.claude_desktop.base_url}；上游 ${body.upstream.messages_url}。`;
+          $('claudeProtocolStatus').textContent = `验证通过：Gateway ${body.claude_desktop.base_url}；${formatProtocolSuccess(body).replace('验证通过：', '')}`;
         } else {
           $('claudeProtocolStatus').textContent = `验证失败：${body.error || '请求失败'}`;
         }

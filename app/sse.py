@@ -2,7 +2,13 @@ import json
 import time
 from typing import Any
 
-from .adapters import content_to_text, make_message_id, make_response_id, responses_usage
+from .adapters import (
+    chat_finish_reason_to_claude_stop_reason,
+    content_to_text,
+    make_message_id,
+    make_response_id,
+    responses_usage,
+)
 
 
 def encode_sse(event: str, data: dict[str, Any] | str) -> str:
@@ -164,3 +170,76 @@ async def chat_stream_to_responses_sse(chunks: Any, model: str):
     text = "".join(text_parts)
     for event in response_finished(response_id, message_id, model, text, usage, sequence):
         yield event
+
+
+async def chat_stream_to_anthropic_sse(chunks: Any, model: str):
+    message_id = make_message_id()
+    text_parts: list[str] = []
+    usage = None
+    stop_reason = None
+
+    yield encode_sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        },
+    )
+    yield encode_sse(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+
+    async for chunk in chunks:
+        if chunk == "[DONE]":
+            continue
+        if not isinstance(chunk, dict):
+            continue
+
+        choices = chunk.get("choices") or []
+        if choices:
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            content = delta.get("content") or delta.get("reasoning_content")
+            if content:
+                content = content_to_text(content)
+                text_parts.append(content)
+                yield encode_sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": content},
+                    },
+                )
+            stop_reason = chat_finish_reason_to_claude_stop_reason(choice.get("finish_reason")) or stop_reason
+        if chunk.get("usage"):
+            usage = responses_usage(chunk["usage"])
+
+    usage = usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    yield encode_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+    yield encode_sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"],
+            },
+        },
+    )
+    yield encode_sse("message_stop", {"type": "message_stop"})
