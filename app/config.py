@@ -411,3 +411,16 @@ def update_active_profile_models(models: list[str]) -> dict[str, Any]:
     config["active_profile"] = config["codex"]["active_profile"]
     save_runtime_config_document(config)
     return public_profile(profile)
+
+
+def update_profile_models(profile_id: str, models: list[str]) -> dict[str, Any]:
+    config = normalized_runtime_config()
+    if profile_id not in config["profiles"]:
+        raise KeyError(profile_id)
+    profile = config["profiles"][profile_id]
+    profile["models"] = models
+    if profile["default_model"] not in models and models:
+        profile["default_model"] = models[0]
+    config["active_profile"] = config["codex"]["active_profile"]
+    save_runtime_config_document(config)
+    return public_profile(profile)

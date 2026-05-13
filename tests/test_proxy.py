@@ -1183,10 +1183,12 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert "添加中转平台" in text
     assert "修改当前平台" in text
     assert "profileDialog" in text
-    assert 'id="modelMenu"' in text
-    assert 'renderModelMenu' in text
-    assert 'showAllModels' in text
-    assert 'setRefreshLoading' in text
+    assert 'id="codexDefaultModel"' in text
+    assert 'id="codexModelMenu"' in text
+    assert 'id="claudeRefreshModels"' in text
+    assert 'data-mapping-field="upstream_model"' in text
+    assert 'data-mapping-menu="${index}"' in text
+    assert 'createModelPicker' in text
     assert '正在刷新模型' in text
     assert "保存并生效" in text
     assert "保存映射" in text
@@ -1219,7 +1221,137 @@ def test_admin_page_uses_searchable_model_picker_and_aiproxy_labels():
     assert text.count("选择中转平台") == 2
     assert "Claude 使用的中转平台" not in text
     assert "选择后自动生效。" in text
+    assert text.count("选择后自动生效。") == 2
+    assert "没有匹配的模型" not in text
     assert 'datalist' not in text
+    dialog = text.split('<dialog id="profileDialog">', 1)[1].split("</dialog>", 1)[0]
+    assert "默认模型" not in dialog
+    assert "刷新模型" not in dialog
+    claude_panel = text.split('<section class="claude-panel panel-hidden">', 1)[1].split("</section>", 1)[0]
+    assert '<button id="claudeRefreshModels" class="secondary" type="button">刷新模型</button>' in claude_panel
+    assert "右侧模型可直接输入，也可从刷新后的候选列表中选择；保存时只影响模型映射。" in claude_panel
+
+
+def test_refresh_profile_models_updates_selected_namespace_profile(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    async def fake_fetch(profile):
+        if profile["name"] == "Claude Provider":
+            return ["glm-5.2", "glm-5.1"]
+        return ["gpt-5.5", "gpt-5.4"]
+
+    monkeypatch.setattr("app.main.fetch_profile_models", fake_fetch)
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/codex-provider",
+        json={
+            "name": "Codex Provider",
+            "base_url": "https://codex.example",
+            "api_key": "codex-key",
+            "default_model": "gpt-5.5",
+            "models": "gpt-5.5",
+        },
+    )
+    client.post(
+        "/admin/profiles/claude-provider",
+        json={
+            "name": "Claude Provider",
+            "base_url": "https://claude.example",
+            "api_key": "claude-key",
+            "default_model": "glm-5.1",
+            "models": "glm-5.1",
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "claude-provider",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post("/admin/profiles/claude-provider/models/refresh?namespace=claude")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["models"] == ["glm-5.2", "glm-5.1"]
+    config = client.get("/admin/config").json()["config"]
+    assert config["profiles"]["claude-provider"]["models"] == ["glm-5.2", "glm-5.1"]
+    assert config["profiles"]["codex-provider"]["models"] == ["gpt-5.5"]
+
+
+def test_saving_codex_profile_default_model_keeps_claude_mappings(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/shared",
+        json={
+            "name": "Shared Provider",
+            "base_url": "https://shared.example",
+            "api_key": "shared-key",
+            "default_model": "gpt-5.5",
+            "models": ["gpt-5.5", "gpt-5.4"],
+        },
+    )
+    client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "shared",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    response = client.post(
+        "/admin/profiles/shared?namespace=codex",
+        json={
+            "name": "Shared Provider",
+            "base_url": "https://shared.example",
+            "api_key": "shared-key",
+            "default_model": "gpt-5.4",
+            "models": ["gpt-5.5", "gpt-5.4"],
+            "user_agent": "curl/8.7.1",
+            "timeout_seconds": 300,
+        },
+    )
+
+    assert response.status_code == 200
+    config = client.get("/admin/config").json()["config"]
+    assert config["profiles"]["shared"]["default_model"] == "gpt-5.4"
+    assert config["claude"]["model_mappings"] == [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}]
+
+
+def test_saving_claude_config_does_not_override_profile_default_model(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.local.json"
+    monkeypatch.setenv("CODEXPROXY_CONFIG_PATH", str(config_path))
+
+    client = TestClient(create_app())
+    client.post(
+        "/admin/profiles/byte",
+        json={
+            "name": "字节跳动",
+            "base_url": "https://ark.cn-beijing.volces.com/api/coding/v1",
+            "api_key": "byte-key",
+            "default_model": "gpt-5.5",
+            "models": ["gpt-5.5", "glm-5.1"],
+        },
+    )
+
+    response = client.post(
+        "/admin/claude/config",
+        json={
+            "active_profile": "byte",
+            "model_mappings": [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}],
+        },
+    )
+
+    assert response.status_code == 200
+    config = client.get("/admin/config").json()["config"]
+    assert config["profiles"]["byte"]["default_model"] == "gpt-5.5"
+    assert config["claude"]["model_mappings"] == [{"claude_model": "claude-opus-4.6", "upstream_model": "glm-5.1"}]
 
 
 def test_protocol_check_reports_codex_and_upstream_contract(monkeypatch, tmp_path):

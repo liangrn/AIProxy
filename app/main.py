@@ -24,6 +24,7 @@ from .config import (
     save_claude_config,
     save_codex_config,
     save_profile,
+    update_profile_models,
     update_active_profile_models,
 )
 from .sse import chat_stream_to_responses_sse
@@ -474,6 +475,28 @@ def create_app() -> FastAPI:
         models = await fetch_profile_models(profile)
         return {"ok": True, "models": models}
 
+    @app.post("/admin/profiles/{profile_id}/models/refresh")
+    async def refresh_profile_models(profile_id: str, request: Request):
+        namespace = str(request.query_params.get("namespace") or "codex")
+        config = public_settings()
+        active_profile = config["claude"]["active_profile"] if namespace == "claude" else config["codex"]["active_profile"]
+        if active_profile != profile_id:
+            owner = "Claude" if namespace == "claude" else "Codex"
+            raise HTTPException(status_code=400, detail=f"Selected {owner} profile is out of date, please refresh the page.")
+        runtime_config = get_claude_settings() if namespace == "claude" else get_settings()
+        profile = {
+            "name": runtime_config.upstream_provider_name,
+            "base_url": runtime_config.upstream_base_url,
+            "api_key": runtime_config.upstream_api_key,
+            "default_model": runtime_config.upstream_model,
+            "models": runtime_config.upstream_models,
+            "user_agent": runtime_config.upstream_user_agent,
+            "timeout_seconds": runtime_config.request_timeout_seconds,
+        }
+        models = await fetch_profile_models(profile)
+        updated = update_profile_models(profile_id, models)
+        return {"ok": True, "profile_id": profile_id, "profile": updated, "models": updated["models"]}
+
     @app.post("/admin/profiles/draft/protocol/check")
     async def draft_protocol_check(request: Request):
         data = await request.json()
@@ -733,6 +756,9 @@ ADMIN_HTML = """
     .inline-control { height: 42px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: stretch; }
     .inline-control select, .inline-control button { height: 42px; }
     .inline-control button { margin: 0; white-space: nowrap; }
+    .label-note { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+    .label-note label { margin-bottom: 0; }
+    .label-note .muted { margin: 0; white-space: nowrap; }
     button.secondary { background: #44546a; }
     button.danger { background: #b42318; }
     button:disabled { opacity: .45; cursor: not-allowed; }
@@ -795,16 +821,6 @@ ADMIN_HTML = """
       </div>
       <label for="apiKey">API Key</label>
       <input id="apiKey" placeholder="sk-...">
-      <div class="row">
-        <div>
-          <label for="defaultModel">默认模型</label>
-          <div class="combo">
-            <input id="defaultModel" autocomplete="off" placeholder="输入关键字过滤模型">
-            <div id="modelMenu" class="model-menu"></div>
-          </div>
-        </div>
-        <div><label>&nbsp;</label><button id="refreshModels" class="secondary">刷新模型</button></div>
-      </div>
       <details>
         <summary>高级设置</summary>
         <div class="row">
@@ -823,7 +839,10 @@ ADMIN_HTML = """
     <section class="codex-panel">
       <div class="row">
         <div>
-          <label for="profileSelect">选择中转平台</label>
+          <div class="label-note">
+            <label for="profileSelect">选择中转平台</label>
+            <p class="muted">选择后自动生效。</p>
+          </div>
           <select id="profileSelect"></select>
         </div>
         <div>
@@ -838,7 +857,20 @@ ADMIN_HTML = """
           </div>
         </div>
       </div>
-      <p class="muted">选择后自动生效。</p>
+      <div class="row">
+        <div>
+          <label for="codexDefaultModel">默认模型</label>
+          <div class="combo">
+            <input id="codexDefaultModel" autocomplete="off" placeholder="输入关键字过滤模型">
+            <div id="codexModelMenu" class="model-menu"></div>
+          </div>
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <button id="codexRefreshModels" class="secondary" type="button">刷新模型</button>
+        </div>
+      </div>
+      <p class="muted">默认模型属于当前中转平台配置；若另一侧也使用该平台，候选模型列表会同步更新。</p>
       <div class="status-row">
         <div id="codexProtocolStatus" class="status"></div>
       </div>
@@ -865,7 +897,10 @@ ADMIN_HTML = """
     <section class="claude-panel panel-hidden">
       <div class="row">
         <div>
-          <label for="claudeProfileSelect">选择中转平台</label>
+          <div class="label-note">
+            <label for="claudeProfileSelect">选择中转平台</label>
+            <p class="muted">选择后自动生效。</p>
+          </div>
           <select id="claudeProfileSelect"></select>
         </div>
         <div>
@@ -883,9 +918,14 @@ ADMIN_HTML = """
       <div class="status-row">
         <div id="claudeProtocolStatus" class="status"></div>
       </div>
-      <p class="muted">选择后自动生效。</p>
       <p class="muted">Claude Desktop Developer Mode 的 Gateway URL填：<code id="claudeGatewayUrl"></code>。API Key可填任意非空值。</p>
-      <label>模型映射</label>
+      <div class="title-row" style="margin-top: 14px;">
+        <div>
+          <label style="margin-top: 0;">模型映射</label>
+          <p class="muted" style="margin: 6px 0 0;">右侧模型可直接输入，也可从刷新后的候选列表中选择；保存时只影响模型映射。</p>
+        </div>
+        <button id="claudeRefreshModels" class="secondary" type="button">刷新模型</button>
+      </div>
       <div id="mappingRows"></div>
       <div class="actions">
         <button id="addMapping" class="secondary" type="button">添加映射</button>
@@ -914,10 +954,12 @@ ADMIN_HTML = """
   <script>
     const $ = (id) => document.getElementById(id);
     let currentConfig = null;
-    let currentModels = [];
     let currentMappings = [];
     let activeTab = 'codex';
     let editingProfileId = null;
+    let codexModelPicker = null;
+    let claudeModelPickers = [];
+    let uiBusy = false;
 
     function showTab(tab) {
       activeTab = tab;
@@ -933,6 +975,25 @@ ADMIN_HTML = """
       button.textContent = isLoading ? loadingText : normalText;
     }
 
+    function setUiBusy(isBusy) {
+      uiBusy = isBusy;
+      ['profileSelect', 'codexApiStyle', 'claudeProfileSelect', 'claudeApiStyle', 'codexDefaultModel', 'codexRefreshModels', 'claudeRefreshModels', 'saveClaudeConfig', 'addMapping'].forEach((id) => {
+        const element = $(id);
+        if (element) {
+          element.disabled = isBusy;
+        }
+      });
+      document.querySelectorAll('[data-remove-mapping]').forEach((button) => {
+        button.disabled = isBusy;
+      });
+      document.querySelectorAll('[data-mapping-field="claude_model"]').forEach((input) => {
+        input.disabled = isBusy;
+      });
+      claudeModelPickers.forEach((picker) => {
+        picker.input.disabled = isBusy;
+      });
+    }
+
     function activeProfileIdForTab() {
       return activeTab === 'claude' ? currentConfig.claude.active_profile : currentConfig.codex.active_profile;
     }
@@ -942,8 +1003,6 @@ ADMIN_HTML = """
         name: $('provider').value,
         base_url: $('baseUrl').value,
         api_key: $('apiKey').value,
-        default_model: $('defaultModel').value,
-        models: currentModels,
         user_agent: $('userAgent').value || 'curl/8.7.1',
         timeout_seconds: Number($('timeout').value || 300)
       };
@@ -958,9 +1017,6 @@ ADMIN_HTML = """
         $('provider').value = '';
         $('baseUrl').value = '';
         $('apiKey').value = '';
-        $('defaultModel').value = '';
-        currentModels = [];
-        renderModelMenu();
         $('timeout').value = 300;
         $('userAgent').value = 'curl/8.7.1';
         $('profileDialogTitle').textContent = '添加中转平台';
@@ -978,12 +1034,91 @@ ADMIN_HTML = """
       $('provider').value = profile.name;
       $('baseUrl').value = profile.base_url;
       $('apiKey').value = profile.api_key || '';
-      $('defaultModel').value = profile.default_model;
-      currentModels = profile.models || [];
-      renderModelMenu();
       $('timeout').value = profile.timeout_seconds || 300;
       $('userAgent').value = profile.user_agent || 'curl/8.7.1';
       $('codexModelText').textContent = profile.default_model;
+    }
+
+    function createModelPicker(input, menu, getModels, onSelect, getValue) {
+      const picker = {
+        input,
+        menu,
+        getModels,
+        onSelect,
+        getValue
+      };
+
+      picker.render = () => {
+        const models = getModels();
+        menu.innerHTML = '';
+        if (!models.length) {
+          const empty = document.createElement('div');
+          empty.className = 'model-empty';
+          empty.textContent = '先刷新模型';
+          menu.appendChild(empty);
+          return;
+        }
+        for (const model of models) {
+          const option = document.createElement('button');
+          option.type = 'button';
+          option.className = 'model-option' + (model === getValue() ? ' active' : '');
+          option.textContent = model;
+          option.onclick = () => {
+            input.value = model;
+            onSelect(model);
+            picker.close();
+            picker.render();
+          };
+          menu.appendChild(option);
+        }
+      };
+
+      picker.open = () => {
+        picker.render();
+        menu.classList.add('open');
+      };
+
+      picker.close = () => {
+        menu.classList.remove('open');
+      };
+
+      input.addEventListener('focus', () => {
+        if (!uiBusy) {
+          picker.open();
+        }
+      });
+      input.addEventListener('input', () => {
+        onSelect(input.value);
+        if (!uiBusy) {
+          picker.open();
+        }
+      });
+
+      return picker;
+    }
+
+    function currentCodexProfile() {
+      return currentConfig?.profiles?.[$('profileSelect').value] || null;
+    }
+
+    function currentClaudeProfile() {
+      return currentConfig?.profiles?.[$('claudeProfileSelect').value] || null;
+    }
+
+    function renderCodexModelPicker() {
+      if (!codexModelPicker) {
+        codexModelPicker = createModelPicker(
+          $('codexDefaultModel'),
+          $('codexModelMenu'),
+          () => currentCodexProfile()?.models || [],
+          () => {},
+          () => $('codexDefaultModel').value
+        );
+      }
+      const profile = currentCodexProfile();
+      $('codexDefaultModel').value = profile?.default_model || '';
+      $('codexModelText').textContent = profile?.default_model || '';
+      codexModelPicker.render();
     }
 
     function renderClaudeProfiles() {
@@ -1006,22 +1141,38 @@ ADMIN_HTML = """
 
     function renderMappings() {
       $('mappingRows').innerHTML = '';
+      claudeModelPickers = [];
       currentMappings.forEach((mapping, index) => {
         const row = document.createElement('div');
         row.className = 'mapping-row';
         row.innerHTML = `
           <div><input data-mapping-index="${index}" data-mapping-field="claude_model" placeholder="claude-opus-4.6"></div>
-          <div><input data-mapping-index="${index}" data-mapping-field="upstream_model" placeholder="glm-5.1"></div>
+          <div class="combo">
+            <input data-mapping-index="${index}" data-mapping-field="upstream_model" placeholder="glm-5.1" autocomplete="off">
+            <div class="model-menu" data-mapping-menu="${index}"></div>
+          </div>
           <button class="danger" type="button" data-remove-mapping="${index}">删除</button>
         `;
         $('mappingRows').appendChild(row);
         row.querySelector('[data-mapping-field="claude_model"]').value = mapping.claude_model || '';
-        row.querySelector('[data-mapping-field="upstream_model"]').value = mapping.upstream_model || '';
+        const upstreamInput = row.querySelector('[data-mapping-field="upstream_model"]');
+        const upstreamMenu = row.querySelector('[data-mapping-menu]');
+        upstreamInput.value = mapping.upstream_model || '';
+        const picker = createModelPicker(
+          upstreamInput,
+          upstreamMenu,
+          () => currentClaudeProfile()?.models || [],
+          (value) => {
+            currentMappings[index].upstream_model = value;
+          },
+          () => currentMappings[index].upstream_model || ''
+        );
+        claudeModelPickers.push(picker);
       });
-      document.querySelectorAll('[data-mapping-field]').forEach((input) => {
+      document.querySelectorAll('[data-mapping-field="claude_model"]').forEach((input) => {
         input.oninput = () => {
           const index = Number(input.dataset.mappingIndex);
-          currentMappings[index][input.dataset.mappingField] = input.value;
+          currentMappings[index].claude_model = input.value;
         };
       });
       document.querySelectorAll('[data-remove-mapping]').forEach((button) => {
@@ -1032,59 +1183,15 @@ ADMIN_HTML = """
       });
     }
 
-    function renderModelMenu() {
-      const query = $('defaultModel').value.trim().toLowerCase();
-      const matches = currentModels.filter((model) => model.toLowerCase().includes(query));
-      $('modelMenu').innerHTML = '';
-      if (!matches.length) {
-        const empty = document.createElement('div');
-        empty.className = 'model-empty';
-        empty.textContent = currentModels.length ? '没有匹配的模型' : '先刷新模型';
-        $('modelMenu').appendChild(empty);
-        return;
-      }
-      for (const model of matches) {
-        const option = document.createElement('button');
-        option.type = 'button';
-        option.className = 'model-option' + (model === $('defaultModel').value ? ' active' : '');
-        option.textContent = model;
-        option.onclick = () => {
-          $('defaultModel').value = model;
-          $('modelMenu').classList.remove('open');
-          renderModelMenu();
-        };
-        $('modelMenu').appendChild(option);
-      }
-    }
-
-    function showAllModels() {
-      $('defaultModel').value = '';
-      renderModelMenu();
-      $('modelMenu').classList.add('open');
-    }
-
-    function setRefreshLoading(isLoading) {
-      $('refreshModels').disabled = isLoading;
-      $('refreshModels').textContent = isLoading ? '刷新中...' : '刷新模型';
-      if (isLoading) {
-        $('configStatus').textContent = '正在刷新模型，请稍候。';
-      }
-    }
-
-    $('defaultModel').addEventListener('focus', () => {
-      renderModelMenu();
-      $('modelMenu').classList.add('open');
-    });
-
-    $('defaultModel').addEventListener('input', () => {
-      renderModelMenu();
-      $('modelMenu').classList.add('open');
-    });
-
     document.addEventListener('click', (event) => {
-      if (!$('modelMenu').contains(event.target) && event.target !== $('defaultModel')) {
-        $('modelMenu').classList.remove('open');
+      if (codexModelPicker && !codexModelPicker.menu.contains(event.target) && event.target !== codexModelPicker.input) {
+        codexModelPicker.close();
       }
+      claudeModelPickers.forEach((picker) => {
+        if (!picker.menu.contains(event.target) && event.target !== picker.input) {
+          picker.close();
+        }
+      });
     });
 
     async function refresh() {
@@ -1101,6 +1208,7 @@ ADMIN_HTML = """
       $('profileSelect').value = config.codex.active_profile;
       $('codexApiStyle').value = config.codex.api_style || 'auto';
       fillProfile(config.codex.active_profile);
+      renderCodexModelPicker();
       renderClaudeProfiles();
       $('proxyUrl').value = `http://${config.listen_host}:${config.listen_port}`;
 
@@ -1112,6 +1220,7 @@ ADMIN_HTML = """
     }
 
     async function saveCodexConfig(statusText) {
+      setUiBusy(true);
       $('codexProtocolStatus').textContent = statusText;
       const payload = {
         active_profile: $('profileSelect').value,
@@ -1121,9 +1230,11 @@ ADMIN_HTML = """
       const body = await res.json();
       $('codexProtocolStatus').textContent = res.ok ? 'Codex 当前配置已生效。' : `切换失败：${body.detail}`;
       await refresh();
+      setUiBusy(false);
     }
 
     async function saveClaudeSelection(statusText) {
+      setUiBusy(true);
       $('claudeStatus').textContent = statusText;
       const payload = {
         active_profile: $('claudeProfileSelect').value,
@@ -1134,6 +1245,7 @@ ADMIN_HTML = """
       const body = await res.json();
       $('claudeStatus').textContent = res.ok ? 'ClaudeProxy 当前配置已生效。' : `切换失败：${body.detail}`;
       await refresh();
+      setUiBusy(false);
     }
 
     $('profileSelect').onchange = async () => {
@@ -1179,21 +1291,58 @@ ADMIN_HTML = """
       }
     };
 
-    $('refreshModels').onclick = async () => {
-      setRefreshLoading(true);
+    async function saveCodexDefaultModel() {
+      const profileId = $('profileSelect').value;
+      const profile = currentCodexProfile();
+      if (!profile) {
+        return;
+      }
+      setUiBusy(true);
+      $('codexProtocolStatus').textContent = '正在保存默认模型，请稍候。';
       try {
-        const res = await fetch('/admin/profiles/draft/models/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(profilePayloadFromDialog()) });
+        const payload = {
+          ...profile,
+          default_model: $('codexDefaultModel').value
+        };
+        const res = await fetch(`/admin/profiles/${encodeURIComponent(profileId)}?namespace=codex`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         const body = await res.json();
-        $('configStatus').textContent = res.ok ? '模型列表已刷新。' : `刷新失败：${body.detail}`;
+        $('codexProtocolStatus').textContent = res.ok ? '默认模型已保存。' : `保存失败：${body.detail || '请求失败'}`;
         if (res.ok) {
-          currentModels = body.models || [];
-          showAllModels();
-          return;
+          await refresh();
         }
       } catch (error) {
-        $('configStatus').textContent = `刷新失败：${error.message}`;
+        $('codexProtocolStatus').textContent = `保存失败：${error.message}`;
       } finally {
-        setRefreshLoading(false);
+        setUiBusy(false);
+      }
+    }
+
+    $('codexDefaultModel').addEventListener('change', saveCodexDefaultModel);
+
+    $('codexRefreshModels').onclick = async () => {
+      const button = $('codexRefreshModels');
+      setButtonLoading(button, true, '刷新中...', '刷新模型');
+      setUiBusy(true);
+      $('codexProtocolStatus').textContent = '正在刷新模型，请稍候。';
+      try {
+        const previousDefaultModel = currentCodexProfile()?.default_model;
+        const res = await fetch(`/admin/profiles/${encodeURIComponent($('profileSelect').value)}/models/refresh?namespace=codex`, { method: 'POST' });
+        const body = await res.json();
+        if (res.ok) {
+          await refresh();
+          const nextDefaultModel = currentCodexProfile()?.default_model;
+          $('codexProtocolStatus').textContent = previousDefaultModel && nextDefaultModel && previousDefaultModel !== nextDefaultModel
+            ? `模型列表已刷新，默认模型已自动切换为 ${nextDefaultModel}。`
+            : '模型列表已刷新。';
+          codexModelPicker?.open();
+        } else {
+          $('codexProtocolStatus').textContent = `刷新失败：${body.detail || '请求失败'}`;
+        }
+      } catch (error) {
+        $('codexProtocolStatus').textContent = `刷新失败：${error.message}`;
+      } finally {
+        setUiBusy(false);
+        setButtonLoading(button, false, '刷新中...', '刷新模型');
       }
     };
 
@@ -1275,6 +1424,7 @@ ADMIN_HTML = """
     $('saveClaudeConfig').onclick = async () => {
       const button = $('saveClaudeConfig');
       setButtonLoading(button, true, '保存中...', '保存映射');
+      setUiBusy(true);
       $('claudeStatus').textContent = '正在保存 ClaudeProxy 模型映射，请稍候。';
       try {
         const payload = {
@@ -1289,7 +1439,31 @@ ADMIN_HTML = """
       } catch (error) {
         $('claudeStatus').textContent = `保存失败：${error.message}`;
       } finally {
+        setUiBusy(false);
         setButtonLoading(button, false, '保存中...', '保存映射');
+      }
+    };
+
+    $('claudeRefreshModels').onclick = async () => {
+      const button = $('claudeRefreshModels');
+      setButtonLoading(button, true, '刷新中...', '刷新模型');
+      setUiBusy(true);
+      $('claudeStatus').textContent = '正在刷新模型，请稍候。';
+      try {
+        const res = await fetch(`/admin/profiles/${encodeURIComponent($('claudeProfileSelect').value)}/models/refresh?namespace=claude`, { method: 'POST' });
+        const body = await res.json();
+        if (res.ok) {
+          await refresh();
+          $('claudeStatus').textContent = '模型列表已刷新。';
+          claudeModelPickers.forEach((picker) => picker.render());
+        } else {
+          $('claudeStatus').textContent = `刷新失败：${body.detail || '请求失败'}`;
+        }
+      } catch (error) {
+        $('claudeStatus').textContent = `刷新失败：${error.message}`;
+      } finally {
+        setUiBusy(false);
+        setButtonLoading(button, false, '刷新中...', '刷新模型');
       }
     };
 
